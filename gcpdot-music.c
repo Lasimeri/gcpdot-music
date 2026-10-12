@@ -1630,6 +1630,8 @@ int main(int argc, char **argv) {
 
     time_t last_fetch = 0, last_ok = 0;
     char queued_id[96] = "", queued_uri[4600] = "", last_track[256] = "";
+    char queued_path[4096] = "", final_for[96] = "";   /* the queued song's file; the track whose final step is done */
+    int queued_prov = 0;   /* the queued song is provisional (replaced if the final forecast draws another band) */
     int queued_band = -1, last_band = -1;
     /* The song this daemon queued, kept on disk: after a restart it is taken
      * over while VLC still holds it at that id, not queued a second time. */
@@ -1785,14 +1787,22 @@ int main(int argc, char **argv) {
                     queued_id[0] = 0;
                 }
             }
-            /* The next song is decided DECIDE_S before this one ends, not when
-             * it starts: the forecast's horizon is then about a minute
-             * instead of the whole song (local backtest: 85.6% right 1
-             * minute ahead, 77.2% at 4). A song with less left (a skip into
-             * its end, a short one) is decided at once. */
+            /* The next song in two steps. When a song starts, a provisional
+             * one is queued at once (a forecast for the minute this song
+             * ends, a whole song ahead), so a song is always waiting.
+             * DECIDE_S before the end the forecast is made again, a minute
+             * or so ahead (local backtest: 85.6% right 1 minute ahead, 77.2%
+             * at 4), and the band drawn again from it: the same band keeps
+             * the provisional song, another replaces it. The band then
+             * follows the final forecast exactly. A song with less left (a
+             * skip into its end, a short one) gets the final step at once. */
             double left_now = md.length > 0 ? (double) (md.length - vlc_position()) / 60e6 : 4;
-            int decide = left_now * 60 <= DECIDE_S || md.length <= 0;
-            if (decide && !queued_id[0] && md.trackid[0] && strcmp(st, "Stopped") != 0 && sn >= 240) {
+            int late = left_now * 60 <= DECIDE_S || md.length <= 0;
+            int can = md.trackid[0] && strcmp(st, "Stopped") != 0 && sn >= 240;
+            int phase = 0;   /* 1 provisional, 2 final */
+            if (can && !late && !queued_id[0]) phase = 1;
+            if (can && late && strcmp(final_for, md.trackid) && (!queued_id[0] || queued_prov)) phase = 2;
+            if (phase) {
                 double left = left_now;
                 if (left < 0) left = 0;
                 /* The forecast is for one minute of the series. Local: the
@@ -1809,20 +1819,18 @@ int main(int argc, char **argv) {
                 if (hmin < 1) hmin = 1;
                 long target = sep[sn - 1] + (long) hmin * 60;
                 double probs[NBANDS] = { 0 };
-                /* The mechanistic forecast first: the dot rebuilt from the
-                 * known minutes and an AR(2) netvar forecast, ranked as the
-                 * live dot is (oracle check 100%; backtest at 2 min 98%
-                 * right, band changes caught 88%, log loss 0.062). It goes
-                 * to Jev as a suggestion and into the blend. */
+                /* The forecast first (local: exact, the future minutes
+                 * chi-square; GCP: the dot rebuilt from an AR(2) netvar
+                 * forecast). It goes to Jev as a suggestion and into the
+                 * blend. */
                 dots_sync();
                 double pa[NBANDS], pf[NBANDS];
                 psum_sync();
                 double neff = mech_forecast(2, sn - 1, hmin, pa) >= 0 ? 100 : 0;
                 int has_a = neff >= 3;
-                /* Jev answers 25 s before the song ends at the latest (about
-                 * 40 s on the 35B with CLAUDE.md; longer while the machine
-                 * trains or the subject loads), at most 300 s; under 35 s
-                 * left it is not asked. A song is queued either way. */
+                /* Jev answers 25 s before the song ends at the latest (a
+                 * median 12.6 s on the GPU), at most 300 s; under 35 s left
+                 * it is not asked. A song is queued either way. */
                 int deadline = (int) (left * 60) - 25;
                 if (deadline > 300) deadline = 300;
                 if (use_jev && deadline >= 10) busy("asking Jev");
@@ -1836,32 +1844,52 @@ int main(int argc, char **argv) {
                 else for (int b = 0; b < NBANDS; b++) pf[b] = probs[b];
                 if (!has_a) for (int b = 0; b < NBANDS; b++) pa[b] = 0;
                 int nb = draw_band(pf);
-                const char *t = pick_track(nb);
-                if (!t) { say("band %s has no songs; using green", band_name[nb]); nb = 3; t = pick_track(nb); }
-                if (t) {
-                    char *u = uri_of(t);
-                    char id[96];
-                    /* At the bottom of the playlist: after its last item. */
-                    char last[96];
-                    if (vlc_last_id(last, sizeof last) != 0) snprintf(last, sizeof last, "%s", md.trackid);
-                    if (vlc_queue(u, last, id, sizeof id) == 0) {
-                        snprintf(queued_id, sizeof queued_id, "%s", id);
-                        snprintf(queued_uri, sizeof queued_uri, "%s", u);
-                        queued_band = nb;
-                        memcpy(last_pf, pf, sizeof last_pf); last_pred_at = target; last_pred = 1; last_pred_jev = from_jev;
-                        FILE *q = fopen(qp, "w");
-                        if (q) { fprintf(q, "%s\t%s\t%d\n", id, u, nb); fclose(q); }
-                        logline("Q\t%ld\t%s\t%.1f\t%.4f\t%s\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%s\t%s\t%ld"
-                                "\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.2f\t%.2f\t%.1f\t%ld\n", (long) now, id, left, dot,
-                                band_name[band], from_jev ? "jev" : "dot", probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], band_name[nb], t,
-                                sn ? (long) (now - sep[sn - 1]) : -1L,
-                                pa[0], pa[1], pa[2], pa[3], pa[4], pa[5], pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], blend_a, blend_c, neff, target);
-                        say("queued at the bottom (%s plays, %.1f min left): band %s; Jev%s [%.2f %.2f %.2f %.2f %.2f %.2f], analog (%.0f) [%.2f %.2f %.2f %.2f %.2f %.2f], "
-                            "blend ^%.2f ^%.2f [%.2f %.2f %.2f %.2f %.2f %.2f] %s", md.trackid, left, band_name[nb], from_jev ? "" : " (none)",
-                            probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], neff, pa[0], pa[1], pa[2], pa[3], pa[4], pa[5],
-                            blend_a, blend_c, pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], t);
-                    } else say("could not queue %s", t);
-                    free(u);
+                const char *t = NULL; char id[96] = ""; int kept = 0;
+                if (phase == 2 && queued_id[0] && queued_prov && nb == queued_band) {
+                    kept = 1; t = queued_path; snprintf(id, sizeof id, "%s", queued_id);
+                } else {
+                    if (phase == 2 && queued_id[0] && queued_prov) {   /* another band: the provisional song out */
+                        sd_bus_error e = SD_BUS_ERROR_NULL;
+                        sd_bus_call_method(bus, PLAYER, MPATH, "org.mpris.MediaPlayer2.TrackList", "RemoveTrack", &e, NULL, "o", queued_id);
+                        sd_bus_error_free(&e);
+                        say("final forecast drew %s, not %s: the provisional song taken out", band_name[nb], band_name[queued_band]);
+                        queued_id[0] = 0; unlink(qp);
+                    }
+                    t = pick_track(nb);
+                    if (!t) { say("band %s has no songs; using green", band_name[nb]); nb = 3; t = pick_track(nb); }
+                    if (t) {
+                        char *u = uri_of(t);
+                        /* At the bottom of the playlist: after its last item. */
+                        char last[96];
+                        if (vlc_last_id(last, sizeof last) != 0) snprintf(last, sizeof last, "%s", md.trackid);
+                        if (vlc_queue(u, last, id, sizeof id) == 0) {
+                            snprintf(queued_id, sizeof queued_id, "%s", id);
+                            snprintf(queued_uri, sizeof queued_uri, "%s", u);
+                            snprintf(queued_path, sizeof queued_path, "%s", t);
+                            queued_band = nb;
+                            FILE *q = fopen(qp, "w");
+                            if (q) { fprintf(q, "%s\t%s\t%d\n", id, u, nb); fclose(q); }
+                        } else { say("could not queue %s", t); id[0] = 0; }
+                        free(u);
+                    }
+                }
+                if (id[0]) {
+                    queued_prov = phase == 1;
+                    if (phase == 2) snprintf(final_for, sizeof final_for, "%s", md.trackid);
+                    memcpy(last_pf, pf, sizeof last_pf); last_pred_at = target; last_pred = 1; last_pred_jev = from_jev;
+                    /* Q: the final forecast, scored on its minute; P: the
+                     * provisional one (logged, not scored) */
+                    logline("%s\t%ld\t%s\t%.1f\t%.4f\t%s\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%s\t%s\t%ld"
+                            "\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.2f\t%.2f\t%.1f\t%ld\n", phase == 1 ? "P" : "Q", (long) now, id, left, dot,
+                            band_name[band], from_jev ? "jev" : "dot", probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], band_name[nb], t,
+                            sn ? (long) (now - sep[sn - 1]) : -1L,
+                            pa[0], pa[1], pa[2], pa[3], pa[4], pa[5], pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], blend_a, blend_c, neff, target);
+                    say("%s (%s plays, %.1f min left): band %s; Jev%s [%.2f %.2f %.2f %.2f %.2f %.2f], forecast [%.2f %.2f %.2f %.2f %.2f %.2f], "
+                        "blend ^%.2f ^%.2f [%.2f %.2f %.2f %.2f %.2f %.2f] %s",
+                        phase == 1 ? "provisional, queued at the bottom" : kept ? "final: same band, provisional song kept" : "final, queued at the bottom",
+                        md.trackid, left, band_name[nb], from_jev ? "" : " (none)",
+                        probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], pa[0], pa[1], pa[2], pa[3], pa[4], pa[5],
+                        blend_a, blend_c, pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], t);
                 }
             }
             snprintf(last_track, sizeof last_track, "%s", md.trackid);

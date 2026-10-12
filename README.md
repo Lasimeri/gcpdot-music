@@ -20,7 +20,7 @@ Phi Jev say where it is going.
 ║  │ dot      local: exact chi-square of 1 h / 2 h summed z^2; gcp: rank of window means   │   ║
 ║  │ bands    red <0.05 orange <0.10 yellow <0.40 green <0.90 teal <0.95 blue              │   ║
 ║  │ forecast local: future minutes chi2(60 h); gcp: AR(2) netvar, windows rebuilt         │   ║
-║  │ 60 s before a song ends: target = the minute the next song starts on                  │   ║
+║  │ song start: provisional next song; 60 s before the end: final forecast, redraw        │   ║
 ║  │   blend Jev^a x forecast^c (refit on scored targets) -> band, song by RDSEED          │   ║
 ║  │ every new minute: 2-minute alert, scored live (alerts-local.tsv)                      │   ║
 ║  └──────┬──────────────────────────┬─────────────────────────────┬───────────────────────┘   ║
@@ -50,12 +50,14 @@ Phi Jev say where it is going.
   minute series is already smoothed, lag-1 correlation 0.964, so it is ranked empirically). Bands as on
   the old dot: red < 0.05 (high variance), orange 0.05-0.10, yellow 0.10-0.40, green 0.40-0.90, teal
   0.90-0.95, blue > 0.95 (low variance).
-- **The decision.** 60 s before the playing song ends (`DECIDE_S`; at once when less is left), the target
-  minute is fixed: local, the last minute closed when the song ends, the dot the next song starts on;
-  GCP, the newest minute plus the time left. The forecast for that minute goes to Jev as a suggestion
-  with the last two hours and its last 8 resolved forecasts (on the GCP source also the egg as a
-  reference); Jev answers within the song's time left
-  less 25 s.
+- **The decision, in two steps.** When a song starts, a provisional next song is queued at once from a
+  forecast for the minute this song ends (a whole song ahead), so a song is always waiting. 60 s before
+  the end (`DECIDE_S`; at once when less is left) the forecast is made again, about a minute ahead, and
+  the band drawn again from it: the same band keeps the provisional song, another band replaces it, so
+  the band follows the final forecast exactly. The target minute: local, the last minute closed when
+  the song ends, the dot the next song starts on; GCP, the newest minute plus the time left. Each
+  forecast goes to Jev as a suggestion with the last two hours and its last 8 resolved forecasts (on
+  the GCP source also the egg as a reference); Jev answers within the song's time left less 25 s.
 - **The pick.** The blend Jev^a x forecast^c (below) gives the band odds; the band is drawn from them with
   RDSEED, then a song from that band's folders, appended at the bottom of the VLC playlist (MPRIS
   `TrackList.AddTrack` after its highest id), one ahead at a time; a restart takes over the song it
@@ -63,8 +65,8 @@ Phi Jev say where it is going.
 - **The record.** `predictions.tsv` (`predictions-local.tsv` with the local source): a `Q` line per queued
   song (time, playlist id, minutes left, dot, band then, Jev or dot, Jev's six probabilities, band drawn,
   file, newest minute's age, the forecast's and the blend's probabilities, exponents, target minute last)
-  and an `S` line when it starts (dot and band then); `K` skips and `R` replays. Each forecast is scored
-  on its target minute's dot once that minute is in.
+  and an `S` line when it starts (dot and band then); `P` provisional forecasts (not scored); `K` skips and
+  `R` replays. Each final forecast is scored on its target minute's dot once that minute is in.
 
 ## Use
 
@@ -109,7 +111,7 @@ matches the realized one, so at a given horizon it is at the ceiling for a rando
 
 The egg's dot crosses band edges about four to five times as often as GCP 2.0's smoothed one, and each
 crossing is decided by bits not yet drawn; the one lever is the horizon, hence the decision 60 s before
-the song ends rather than at its start (a whole song is about 3.5 minutes ahead).
+the song ends (the final step) rather than at its start (a whole song is about 3.5 minutes ahead).
 
 **GCP (rebuilt).** The windows are rebuilt the same way with the new minutes forecast by AR(2) on the
 minute-to-minute changes, ranked exactly as the live dot; the forecaster's past H-step errors at 21
