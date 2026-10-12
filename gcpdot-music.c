@@ -1485,7 +1485,7 @@ static int cmd_mech(int h, int only) {
         }
         static const char *nm[8] = { "last value", "5-min trend", "AR(2) on changes", "ORACLE (actual)", "veridical mapping", "AR(2) hypo-priors", "AR(2) + time of day", "AR(2) + veridical" };
         printf("%d min ahead, netvar by %-17s %d minutes: right %.1f%% (persistence %.1f%%); band changes %d, caught %d (%.1f%%); changes called %d, right %d (%.1f%%); log loss %.3f\n",
-               h, nm[m], n, 100.0 * ok / n, 100.0 * pok / n, ch, chok, ch ? 100.0 * chok / ch : 0, called, calledok, called ? 100.0 * calledok / called : 0, ll / n);
+               h, src_local ? (m == 3 ? "ORACLE (actual)" : "local exact chi2") : nm[m], n, 100.0 * ok / n, 100.0 * pok / n, ch, chok, ch ? 100.0 * chok / ch : 0, called, calledok, called ? 100.0 * calledok / called : 0, ll / n);
     }
     /* A change called only when the AR(2) forecast gives the band now at
      * most 1 - THETA (a change at least THETA), the band called being the
