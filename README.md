@@ -3,6 +3,58 @@
 The next song in VLC chosen by where the old [GCP dot](https://global-mind.org/gcpdot/) would be, with
 Intel Phi Jev forecasting where it is going.
 
+```
+╔═ OUTSIDE THIS PC ══════════════════════════════════════════════════════════════════════════════╗
+║  ┌──────────────────────────────────┐                    ┌──────────────────────────────────┐  ║
+║  │ gcp2.net API (GCP 2.0)           │                    │ gcp2.net/js/data/api_token.js    │  ║
+║  │ getNetVarAggregate24H            │                    │ one public bearer token, shared  │  ║
+║  │ 1440 one-minute netvar values    │                    │ by every visitor (rate limited)  │  ║
+║  └─────────────────┬────────────────┘                    └─────────────────┬────────────────┘  ║
+╚════════════════════╪═══════════════════════════════════════════════════════╪═══════════════════╝
+                     │ on each song change, every 30 min                     │
+                     │ "Too Many Attempts.": wait 5, 15, 30 s                │
+╔═ DESKTOP: Ryzen 7 5800X, RTX 3090 Ti ══════════════════════════════════════════════════════════╗
+║  ┌─────────────────▼───────────────────────────────────────────────────────▼────────────────┐  ║
+║  │ gcpdot-music.service  (C daemon, ~/gcpdot-music, loop every 5 s)                         │  ║
+║  │                                                                                          │  ║
+║  │  netvar series ─▶ live dot: rank of 1 h / 2 h window means, farther from 0.5 ─▶ bands    │  ║
+║  │  (7 days kept)    red <0.05  orange  yellow  green 0.40-0.90  teal  blue >0.95           │  ║
+║  │                                                                                          │  ║
+║  │  egg thread ─▶ 1 trial/s, 200 bits, z=(t-100)/sqrt(50) ─▶ reference dot (chi-square)     │  ║
+║  │                                                                                          │  ║
+║  │  song change ─▶ target minute = newest minute + song time left                           │  ║
+║  │       │                                                                                  │  ║
+║  │       ├─▶ anchored analog: stay rate on band now, rest by dot + 10-min slope analogs     │  ║
+║  │       └─▶ Jev question: 2 h of dot, reference, last 8 resolved forecasts ──┐             │  ║
+║  │                                                                            │             │  ║
+║  │  blend = Jev^a x anchored^c  ◀─────────────────────────────────────────────┘             │  ║
+║  │       │      ▲                                                                           │  ║
+║  │       │      └── refit a, c (min log loss) when target minutes arrive and are scored     │  ║
+║  │       ▼                                                                                  │  ║
+║  │  band draw ─▶ song draw: exp(0.6 replays - 0.8 skips), last 40 excluded                  │  ║
+║  │                                                                                          │  ║
+║  └──────┬─────────────┬────────────────────────────┬─────────────────────────┬─────────────┘   ║
+║         │             │ AddTrack after highest id  ▲ track id, position      │ RDSEED bits     ║
+║         │             ▼                            │ (skip, replay)          │                 ║
+║         │   ┌──────────────────────────────────────┴────────┐     ┌──────────┴──────────────┐  ║
+║         │   │ VLC 3.0.24, MPRIS TrackList                   │     │ CPU RDSEED              │  ║
+║         │   │ songs from (0)MainPL: 21 folders in 6 bands   │     │ hardware random source  │  ║
+║         │   └───────────────────────────────────────────────┘     └─────────────────────────┘  ║
+║         │ mjev query, deadline = song end - 25 s                                               ║
+║         ▼                                                                                      ║
+║  ┌──────────────────────────────────────────────────────────┐                                  ║
+║  │ Intel Phi Jev: xks :8090, Qwen3.8-35B-A3B Q4_K_M, x86    │                                  ║
+║  │ system text ~/CLAUDE.md (XKS_SYSTEM_FILE), ~49 s/answer  │                                  ║
+║  └──────────────────────────────────────────────────────────┘                                  ║
+║                                                                                                ║
+║  ┌─ ~/.local/state/gcpdot-music ───────────────────┐    ┌─ display, bottom-right of DP-2 ────┐ ║
+║  │ netvar.tsv      predictions.tsv (Q S K R)       │    │ gcpdot-show: Alacritty 44x22       │ ║
+║  │ prefs.tsv       egg-*.tsv     compare.tsv       │ ─▶ │ live dot, forecast dot, bands,     │ ║
+║  │ dots  busy  status  queued                      │    │ reference, last hit or miss        │ ║
+║  └─────────────────────────────────────────────────┘    └────────────────────────────────────┘ ║
+╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+```
+
 - **The data:** GCP 2.0's network variance (gcp2.net, one value a minute), fetched the moment a song ends
   (so the next song is chosen on the newest minute; also every 30 min) and kept on
   disk up to 7 days. GCP 1.0 stopped collecting on 3 April 2026. gcp2.net rate-limits its one public token
