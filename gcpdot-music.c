@@ -400,12 +400,155 @@ static double egg_dot_at(long end) {
 }
 static long egg_latest(void) { pthread_mutex_lock(&emu); long m = esn ? emin[esn - 1] : 0; pthread_mutex_unlock(&emu); return m; }
 
+/* ---- forecasting the dot from its own history ----
+ * The dot is a one- and two-hour window moving a minute at a time, so where
+ * it will be a few minutes on shows in where it is and where it is heading.
+ * gdot[] holds the dot of every minute as it was computed then (baseline:
+ * the minutes before it). The analog forecast for h minutes ahead weighs
+ * every past minute by how close its dot and 10-minute slope are to now's
+ * (Gaussian, 0.05 wide in each) and counts the band its dot was in h minutes
+ * after, only over pairs whose outcome was already known. */
+static double gdot[MAXMIN]; static long gdot_ep[MAXMIN]; static int gdn;
+static void dots_sync(void) {
+    if (gdn && sn && gdot_ep[0] != sep[0]) {   /* the series dropped its oldest minutes */
+        int off = 0;
+        while (off < gdn && gdot_ep[off] != sep[0]) off++;
+        if (off >= gdn) gdn = 0;
+        else { memmove(gdot, gdot + off, (gdn - off) * sizeof *gdot); memmove(gdot_ep, gdot_ep + off, (gdn - off) * sizeof *gdot_ep); gdn -= off; }
+    }
+    for (; gdn < sn; gdn++) { gdot[gdn] = dot_at(gdn + 1, 0); gdot_ep[gdn] = sep[gdn]; }
+}
+#define SLOPE_M 10
+#define KW 0.05
+/* Bands h minutes after minute T, from the minutes up to T (outcomes known
+ * by then). Returns the effective number of analogs, 0 when none. */
+static double analog(int t, int h, double p[NBANDS]) {
+    for (int b = 0; b < NBANDS; b++) p[b] = 0;
+    if (t < SLOPE_M || gdot[t] < 0 || gdot[t - SLOPE_M] < 0) return 0;
+    double x = gdot[t], s = gdot[t] - gdot[t - SLOPE_M], w[NBANDS] = { 0 }, sw = 0, sw2 = 0;
+    for (int i = SLOPE_M; i + h <= t; i++) {
+        if (gdot[i] < 0 || gdot[i - SLOPE_M] < 0 || gdot[i + h] < 0) continue;
+        double dx = (gdot[i] - x) / KW, ds = (gdot[i] - gdot[i - SLOPE_M] - s) / KW;
+        double wt = exp(-0.5 * (dx * dx + ds * ds));
+        w[band_of(gdot[i + h])] += wt; sw += wt; sw2 += wt * wt;
+    }
+    if (sw < 1e-12) return 0;
+    double tot = 0;
+    for (int b = 0; b < NBANDS; b++) { p[b] = w[b] + 0.05 * sw / NBANDS + 1e-6; tot += p[b]; }   /* a little mass on every band */
+    for (int b = 0; b < NBANDS; b++) p[b] /= tot;
+    return sw * sw / sw2;
+}
+
+/* The analog forecast anchored on persistence: the band now gets the share
+ * of past pairs h minutes apart that stayed in one band, the rest goes to
+ * the other bands in the analogs' proportions. On the first stored day the
+ * plain analog picked the top band worse than persistence (88.8 against
+ * 94.7% two minutes ahead) while catching a quarter of the band changes;
+ * anchored, its top band is persistence's and its change odds the analogs'. */
+static double anchored(int t, int h, double p[NBANDS]) {
+    double pa[NBANDS];
+    double neff = analog(t, h, pa);
+    if (neff < 3) return neff;
+    int same = 0, all = 0;
+    for (int i = 0; i + h <= t; i++) {
+        if (gdot[i] < 0 || gdot[i + h] < 0) continue;
+        all++; same += band_of(gdot[i]) == band_of(gdot[i + h]);
+    }
+    if (!all) return 0;
+    double s = (same + 1.0) / (all + 2.0);
+    int nb = band_of(gdot[t]);
+    double rest = 1 - pa[nb];
+    for (int b = 0; b < NBANDS; b++) p[b] = b == nb ? s : (rest > 1e-9 ? (1 - s) * pa[b] / rest : (1 - s) / (NBANDS - 1));
+    return neff;
+}
+
+/* Resolved forecasts (predictions.tsv: a Q line joined to the S line of its
+ * song), for scoring, for refitting the blend and as feedback to Jev. */
+struct res { long t; int now_b, act, has_j, has_a, has_f; double pj[NBANDS], pa[NBANDS], pf[NBANDS]; double h; };
+static struct res *rs; static int rn, rcap;
+static double blend_a = 0.5, blend_c = 1.0;   /* p ∝ Jev^a * analog^c until refitted */
+static int band_idx(const char *s) { for (int b = 0; b < NBANDS; b++) if (!strcmp(s, band_name[b])) return b; return -1; }
+static void load_resolved(void) {
+    rn = 0;
+    char p[700]; snprintf(p, sizeof p, "%s/predictions.tsv", statedir);
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    struct res pend[64]; char pid[64][96]; int pn = 0;
+    char line[8192];
+    while (fgets(line, sizeof line, f)) {
+        char *fld[40]; int nf = 0;
+        for (char *s = strtok(line, "\t\n"); s && nf < 40; s = strtok(NULL, "\t\n")) fld[nf++] = s;
+        if (nf >= 15 && !strcmp(fld[0], "Q")) {
+            struct res r; memset(&r, 0, sizeof r);
+            r.t = atol(fld[1]); r.h = atof(fld[3]); r.now_b = band_idx(fld[5]);
+            r.has_j = !strcmp(fld[6], "jev");
+            for (int b = 0; b < NBANDS; b++) r.pj[b] = atof(fld[7 + b]);
+            if (nf >= 28) { r.has_a = 1; r.has_f = 1; for (int b = 0; b < NBANDS; b++) { r.pa[b] = atof(fld[16 + b]); r.pf[b] = atof(fld[22 + b]); } }
+            if (r.has_a) { double t = 0; for (int b = 0; b < NBANDS; b++) t += r.pa[b]; if (t <= 0) r.has_a = r.has_f = 0; }
+            if (pn == 64) { memmove(pend, pend + 1, 63 * sizeof *pend); memmove(pid, pid + 1, 63 * sizeof *pid); pn = 63; }
+            int k = pn++;
+            pend[k] = r; snprintf(pid[k], sizeof pid[k], "%s", fld[2]);
+        } else if (nf >= 5 && !strcmp(fld[0], "S")) {
+            for (int k = pn - 1; k >= 0; k--) if (!strcmp(pid[k], fld[2])) {
+                struct res r = pend[k]; r.act = band_idx(fld[4]);
+                if (r.act >= 0 && r.now_b >= 0) {
+                    if (rn == rcap) { rcap = rcap ? rcap * 2 : 256; rs = realloc(rs, rcap * sizeof *rs); }
+                    rs[rn++] = r;
+                }
+                memmove(pend + k, pend + k + 1, (pn - k - 1) * sizeof *pend); memmove(pid + k, pid + k + 1, (pn - k - 1) * sizeof *pid); pn--;
+                break;
+            }
+        }
+    }
+    fclose(f);
+}
+static void pool(const double pj[NBANDS], int has_j, const double pa[NBANDS], int has_a, double a, double c, double out[NBANDS]) {
+    double t = 0;
+    for (int b = 0; b < NBANDS; b++) {
+        double lj = has_j ? log(pj[b] > 1e-4 ? pj[b] : 1e-4) : 0, la = has_a ? log(pa[b] > 1e-4 ? pa[b] : 1e-4) : 0;
+        out[b] = exp((has_j ? a : 0) * lj + (has_a ? c : 0) * la);
+        t += out[b];
+    }
+    for (int b = 0; b < NBANDS; b++) out[b] = t > 0 ? out[b] / t : 1.0 / NBANDS;
+}
+/* The exponents that gave the lowest mean log loss on every resolved
+ * forecast holding both parts (grid 0..2 by 0.25); defaults below 10. */
+static void refit(void) {
+    int n = 0;
+    for (int i = 0; i < rn; i++) if (rs[i].has_j && rs[i].has_a) n++;
+    if (n < 10) return;
+    double best = 1e9, ba = blend_a, bc = blend_c;
+    for (int ai = 0; ai <= 8; ai++) for (int ci = 0; ci <= 8; ci++) {
+        if (!ai && !ci) continue;
+        double a = ai * 0.25, c = ci * 0.25, loss = 0, q[NBANDS];
+        for (int i = 0; i < rn; i++) if (rs[i].has_j && rs[i].has_a) {
+            pool(rs[i].pj, 1, rs[i].pa, 1, a, c, q);
+            loss -= log(q[rs[i].act] > 1e-6 ? q[rs[i].act] : 1e-6);
+        }
+        if (loss < best) { best = loss; ba = a; bc = c; }
+    }
+    blend_a = ba; blend_c = bc;
+    say("blend refitted on %d resolved forecasts: Jev^%.2f * analog^%.2f, mean log loss %.3f", n, ba, bc, best / n);
+}
+/* Jev's recent record, for its state: its top band and probability, and
+ * the band at the song's start. */
+static void feedback(char *out, size_t n) {
+    out[0] = 0;
+    int k = 0, o = 0;
+    for (int i = rn - 1; i >= 0 && k < 8; i--) {
+        if (!rs[i].has_j) continue;
+        int top = 0; for (int b = 1; b < NBANDS; b++) if (rs[i].pj[b] > rs[i].pj[top]) top = b;
+        o += snprintf(out + o, n - o, "%s %.0f min ahead: predicted %s %.2f, actual %s", k ? ";" : "", rs[i].h, band_name[top], rs[i].pj[top], band_name[rs[i].act]);
+        k++;
+    }
+}
+
 /* ---- Jev ---- */
 /* DEADLINE_S: Jev must answer within it (the song playing ends soon after),
  * else the caller queues on the dot's band now. */
 static int ask_jev(double horizon_min, int deadline_s, double probs[NBANDS]) {
     if (sn < 120) return -1;
-    char state[4096]; int o = 0;
+    char state[8192]; int o = 0;
     o += snprintf(state + o, sizeof state - o, "GCP 2.0 global network variance (netvar), the mean of each 10 minutes over the last two hours, oldest first:");
     for (int k = 0; k < 12; k++) {
         double s = 0; for (int i = sn - 120 + k * 10; i < sn - 120 + (k + 1) * 10; i++) s += sval[i];
@@ -429,10 +572,13 @@ static int ask_jev(double horizon_min, int deadline_s, double probs[NBANDS]) {
         }
         o += snprintf(state + o, sizeof state - o, ". Reference now: %.2f (%s).", rnow, band_name[band_of(rnow)]);
     }
+    /* Its own recent record, so a miss can move the next forecast. */
+    char fb[1500]; feedback(fb, sizeof fb);
+    if (fb[0]) o += snprintf(state + o, sizeof state - o, " Your recent forecasts of this (your top band and its probability, then the band when that song started):%s.", fb);
     char choice[1024]; int c = 0;
     c += snprintf(choice + c, sizeof choice - c, "band=Which band will the gcpdot index be in %.0f minutes from now?|", horizon_min < 1 ? 1 : horizon_min);
     for (int b = 0; b < NBANDS; b++) c += snprintf(choice + c, sizeof choice - c, "%s%s:%s", b ? ";" : "", band_name[b], band_desc[b]);
-    char cmd[6000];
+    char cmd[10000];
     snprintf(cmd, sizeof cmd, "timeout %d '%s/.local/bin/mjev' query --state '%s' --choice '%s' 2>/dev/null", deadline_s, home, state, choice);
     char *out = run_read(cmd, NULL);
     if (!out) return -1;
@@ -656,9 +802,70 @@ static int cmd_compare(void) {
     return 0;
 }
 
+static int top_of(const double p[NBANDS]) { int t = 0; for (int b = 1; b < NBANDS; b++) if (p[b] > p[t]) t = b; return t; }
+static double ll_of(const double p[NBANDS], int a) { return -log(p[a] > 1e-6 ? p[a] : 1e-6); }
+
+/* Every resolved forecast scored: the top band right, and the mean log loss
+ * (lower is better; a fair six-way guess is 1.79), for persistence (the band
+ * when asked), Jev, the analog model and the blend; and the same on the
+ * songs where the band changed, the only ones persistence gets wrong. */
+static int cmd_score(void) {
+    load_resolved();
+    if (!rn) { printf("no resolved forecasts yet (%s/predictions.tsv)\n", statedir); return 1; }
+    struct { const char *name; int n, ok, xn, xok; double ll; } m[4] = { { "persistence" }, { "Jev" }, { "analog" }, { "blend" } };
+    for (int i = 0; i < rn; i++) {
+        struct res *r = &rs[i];
+        int cross = r->now_b != r->act;
+        m[0].n++; m[0].ok += r->now_b == r->act; m[0].xn += cross;
+        if (r->has_j) { int ok = top_of(r->pj) == r->act; m[1].n++; m[1].ok += ok; m[1].ll += ll_of(r->pj, r->act); m[1].xn += cross; m[1].xok += cross && ok; }
+        if (r->has_a) { int ok = top_of(r->pa) == r->act; m[2].n++; m[2].ok += ok; m[2].ll += ll_of(r->pa, r->act); m[2].xn += cross; m[2].xok += cross && ok; }
+        if (r->has_f) { int ok = top_of(r->pf) == r->act; m[3].n++; m[3].ok += ok; m[3].ll += ll_of(r->pf, r->act); m[3].xn += cross; m[3].xok += cross && ok; }
+    }
+    printf("%-12s %6s %10s %9s %15s\n", "forecaster", "songs", "top right", "log loss", "band changes");
+    for (int k = 0; k < 4; k++) {
+        if (!m[k].n) { printf("%-12s %6d\n", m[k].name, 0); continue; }
+        char ll[16]; if (k) snprintf(ll, sizeof ll, "%.3f", m[k].ll / m[k].n); else snprintf(ll, sizeof ll, "-");
+        printf("%-12s %6d %9.1f%% %9s %8d/%d right\n", m[k].name, m[k].n, 100.0 * m[k].ok / m[k].n, ll, m[k].xok, m[k].xn);
+    }
+    refit();
+    printf("blend now: Jev^%.2f * analog^%.2f\n", blend_a, blend_c);
+    return 0;
+}
+
+/* The analog model on the stored series: at every minute, the forecast for
+ * H minutes on from the minutes before it only, against persistence. */
+static int cmd_backtest(int h) {
+    series_load();
+    dots_sync();
+    int n = 0, pok = 0, aok = 0, cok = 0, xn = 0, xa = 0, xp = 0; double all = 0, cll = 0, pll = 0;
+    for (int t = 360; t + h < gdn; t++) {
+        if (gdot[t] < 0 || gdot[t + h] < 0) continue;
+        double p[NBANDS], c[NBANDS];
+        if (analog(t, h, p) < 3 || anchored(t, h, c) < 3) continue;
+        int act = band_of(gdot[t + h]), now_b = band_of(gdot[t]), top = top_of(p);
+        /* persistence as a distribution: the stay rate on the band now
+         * (the anchored model's), the rest even */
+        double ps = c[now_b], pp = act == now_b ? ps : (1 - ps) / (NBANDS - 1);
+        n++; pok += now_b == act; aok += top == act; cok += top_of(c) == act;
+        all += ll_of(p, act); cll += ll_of(c, act); pll += -log(pp > 1e-6 ? pp : 1e-6);
+        if (now_b != act) { xn++; xa += top == act; }
+        else xp++;
+    }
+    if (!n) { printf("too little series for a backtest (%d minutes)\n", gdn); return 1; }
+    printf("backtest, %d minutes ahead, %d minutes forecast (of %d kept):\n", h, n, gdn);
+    printf("  persistence: %.1f%% right, mean log loss %.3f (stay rate on the band now, the rest even)\n", 100.0 * pok / n, pll / n);
+    printf("  analog:      %.1f%% right, mean log loss %.3f; on the %d band changes %d right (%.1f%%)\n", 100.0 * aok / n, all / n, xn, xa, xn ? 100.0 * xa / xn : 0);
+    printf("  anchored:    %.1f%% right, mean log loss %.3f\n", 100.0 * cok / n, cll / n);
+    printf("Consecutive minutes overlap, so the independent tests are far fewer than %d.\n", n);
+    (void) xp;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     paths();
+    if (argc > 1 && !strcmp(argv[1], "score")) return cmd_score();
+    if (argc > 1 && !strcmp(argv[1], "backtest")) return cmd_backtest(argc > 2 ? atoi(argv[2]) : 4);
     if (argc > 1 && !strcmp(argv[1], "dot")) return cmd_dot();
     if (argc > 1 && !strcmp(argv[1], "compare")) return cmd_compare();
     if (argc > 1 && !strcmp(argv[1], "status")) {
@@ -667,13 +874,17 @@ int main(int argc, char **argv) {
         char b[4096]; size_t n = fread(b, 1, sizeof b - 1, f); b[n] = 0; fclose(f); fputs(b, stdout);
         return 0;
     }
-    if (argc > 1) { fprintf(stderr, "gcpdot-music [dot|compare|status]\n"); return 2; }
+    if (argc > 1) { fprintf(stderr, "gcpdot-music [dot|compare|score|backtest [MIN]|status]\n"); return 2; }
 
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     load_conf();
     scan_tracks();
     series_load();
     egg_load();
+    dots_sync();
+    load_resolved();
+    refit();
+    say("forecasts: %d resolved so far; blend Jev^%.2f * analog^%.2f", rn, blend_a, blend_c);
     pthread_t egg;
     if (pthread_create(&egg, NULL, egg_thread, NULL)) { say("the reference egg did not start"); return 1; }
     say("reference egg: %d minutes kept, one 200-bit RDSEED trial a second from now", esn);
@@ -756,6 +967,8 @@ int main(int argc, char **argv) {
                 say("started (%s, dot now %.3f %s)", band_name[queued_band], dot, band_name[band]);
                 queued_id[0] = 0;
                 unlink(qp);   /* played: a restart must not take it over */
+                load_resolved();   /* the outcome counts at once: the blend refitted */
+                refit();
             }
             /* A song added after ours is playing (opened from the file
              * manager: VLC appends and plays it), so ours sits before it and
@@ -801,7 +1014,18 @@ int main(int argc, char **argv) {
                 int from_jev = use_jev && deadline >= 10 && ask_jev(left, deadline, probs) == 0;
                 if (use_jev && !from_jev) say("Jev %s: queued on the dot's band now", deadline >= 10 ? "did not answer in time" : "not asked (the song ends too soon)");
                 if (!from_jev) { for (int b = 0; b < NBANDS; b++) probs[b] = 0; probs[band] = 1; }
-                int nb = draw_band(probs);
+                /* The analog forecast from the dot's own history, and the
+                 * blend of the two with the exponents refitted on every
+                 * resolved forecast; the band is drawn from the blend. */
+                dots_sync();
+                int hmin = (int) (left + 0.5); if (hmin < 1) hmin = 1;
+                double pa[NBANDS], pf[NBANDS];
+                double neff = anchored(sn - 1, hmin, pa);
+                int has_a = neff >= 3;
+                if (from_jev || has_a) pool(probs, from_jev, pa, has_a, blend_a, blend_c, pf);
+                else for (int b = 0; b < NBANDS; b++) pf[b] = probs[b];
+                if (!has_a) for (int b = 0; b < NBANDS; b++) pa[b] = 0;
+                int nb = draw_band(pf);
                 const char *t = pick_track(nb);
                 if (!t) { say("band %s has no songs; using green", band_name[nb]); nb = 3; t = pick_track(nb); }
                 if (t) {
@@ -816,11 +1040,15 @@ int main(int argc, char **argv) {
                         queued_band = nb;
                         FILE *q = fopen(qp, "w");
                         if (q) { fprintf(q, "%s\t%s\t%d\n", id, u, nb); fclose(q); }
-                        logline("Q\t%ld\t%s\t%.1f\t%.4f\t%s\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%s\t%s\t%ld\n", (long) now, id, left, dot,
+                        logline("Q\t%ld\t%s\t%.1f\t%.4f\t%s\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%s\t%s\t%ld"
+                                "\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.2f\t%.2f\t%.1f\n", (long) now, id, left, dot,
                                 band_name[band], from_jev ? "jev" : "dot", probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], band_name[nb], t,
-                                sn ? (long) (now - sep[sn - 1]) : -1L);
-                        say("queued at the end (%s plays, %.1f min left): %s band %s [%s %.2f %.2f %.2f %.2f %.2f %.2f] %s", md.trackid, left,
-                            from_jev ? "Jev" : "dot", band_name[nb], from_jev ? "Jev" : "dot", probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], t);
+                                sn ? (long) (now - sep[sn - 1]) : -1L,
+                                pa[0], pa[1], pa[2], pa[3], pa[4], pa[5], pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], blend_a, blend_c, neff);
+                        say("queued at the bottom (%s plays, %.1f min left): band %s; Jev%s [%.2f %.2f %.2f %.2f %.2f %.2f], analog (%.0f) [%.2f %.2f %.2f %.2f %.2f %.2f], "
+                            "blend ^%.2f ^%.2f [%.2f %.2f %.2f %.2f %.2f %.2f] %s", md.trackid, left, band_name[nb], from_jev ? "" : " (none)",
+                            probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], neff, pa[0], pa[1], pa[2], pa[3], pa[4], pa[5],
+                            blend_a, blend_c, pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], t);
                     } else say("could not queue %s", t);
                     free(u);
                 }

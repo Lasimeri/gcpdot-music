@@ -44,3 +44,26 @@ name (a whole album in one file) is skipped.
 
 Needs: VLC with its MPRIS interface, `curl`, libsystemd (sd-bus), a CPU with RDSEED, and `mjev` on
 `~/.local/bin` for the forecast (`jev=off` uses the dot's band now).
+
+## Forecasting, and learning from its errors
+
+The individual random bits are unpredictable by design. What is forecast is the dot, a slow hourly window,
+a few minutes ahead (the time left on the playing song):
+
+- **Persistence** (the band stays): right 94.7% at 2 min, 89.5% at 4, 84.8% at 6 on the first stored day.
+  Its only misses are band changes.
+- **Analog:** past minutes with a dot and 10-minute slope like now's, and the band h minutes after them.
+  Alone it picked the top band worse than persistence (88.8% at 2 min) while catching a quarter of the
+  band changes.
+- **Anchored analog** (the model in use): the band now gets the measured stay rate for that horizon, the
+  rest goes to the analogs' bands. Mean log loss 0.248 against persistence's 0.301 at 2 min, 0.419 against
+  0.516 at 4.
+- **Jev** gets its last 8 resolved forecasts (predicted band and probability, actual band) in its state.
+- **The blend** is Jev^a * anchored^c, normalized; a and c are refitted (grid 0..2) to the lowest mean log
+  loss over every resolved forecast each time a song starts (defaults 0.5 and 1 under 10 resolved).
+  The band is drawn from the blend with RDSEED.
+
+```
+gcpdot-music score          # every resolved forecast: top band right and log loss per forecaster
+gcpdot-music backtest 4     # the analog models on the stored series, 4 minutes ahead
+```
