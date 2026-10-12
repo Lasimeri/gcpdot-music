@@ -17,7 +17,7 @@ Intel Phi Jev forecasting where it is going.
                      │ "Too Many Attempts.": wait 5, 15, 30 s                │
 ╔═ DESKTOP: Ryzen 7 5800X, RTX 3090 Ti ══════════════════════════════════════════════════════════╗
 ║  ┌─────────────────▼───────────────────────────────────────────────────────▼────────────────┐  ║
-║  │ gcpdot-music.service  (C daemon, ~/gcpdot-music, loop every 5 s)                         │  ║
+║  │ gcpdot-music.service  (C daemon, ~/global-mood-ring, loop every 5 s)                     │  ║
 ║  │                                                                                          │  ║
 ║  │  netvar series ─▶ live dot: rank of 1 h / 2 h window means, farther from 0.5 ─▶ bands    │  ║
 ║  │  (7 days kept)    red <0.05  orange  yellow  green 0.40-0.90  teal  blue >0.95           │  ║
