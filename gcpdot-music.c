@@ -943,16 +943,16 @@ static int cmd_show(void) {
             fclose(f);
         }
         long now = time(NULL);
-        printf("\033[48;2;10;10;15m\033[2J\033[H\033[38;2;196;148;90m gcp dot\033[0m");
+        printf("\033[48;2;10;10;15m\033[2J\033[H\033[38;2;196;148;90m GCP 2.0 live dot and its forecast\033[0m");
         if (!f || now - t > 30) printf("\033[38;2;138;106;62m  (daemon not writing: systemctl --user status gcpdot-music)\033[0m");
         /* the two dots */
         int pb = havep ? top_of(pred) : -1;
         draw_disc(3, 3, 12, gcp >= 0 ? colour_of(gcp) : 0x333333, bg);
         draw_disc(3, 20, 12, pb >= 0 ? colour_of(band_mid[pb]) : 0x333333, bg);
         printf("\033[48;2;10;10;15m\033[38;2;220;220;220m");
-        printf("\033[10;3H now  %s", gcp >= 0 ? "" : "-");
+        printf("\033[10;3H live %s", gcp >= 0 ? "" : "-");
         if (gcp >= 0) printf("%.3f %s", gcp, band_name[band_of(gcp)]);
-        printf("\033[10;20H next ");
+        printf("\033[10;20H forecast ");
         if (pb >= 0) printf("%s %.0f%%", band_name[pb], 100 * pred[pb]); else printf("-");
         printf("\033[11;3H\033[38;2;138;106;62m%ld min old", latest ? (now - latest) / 60 : 0);
         if (pb >= 0) {
@@ -968,10 +968,10 @@ static int cmd_show(void) {
             }
             printf("\033[19;3H\033[38;2;138;106;62m%s", src);
         }
-        printf("\033[20;3H\033[38;2;150;150;150mreference ");
+        printf("\033[20;3H\033[38;2;150;150;150mthis PC (reference) ");
         if (ref >= 0) { unsigned c = colour_of(ref); printf("\033[38;2;%u;%u;%um●\033[38;2;150;150;150m %.3f %s", c >> 16, (c >> 8) & 255, c & 255, ref, band_name[band_of(ref)]); }
         else printf("warming up");
-        if (lastp[0]) printf("\033[21;3Hlast: %s, was %s %s", lastp, lasta, strcmp(lastp, lasta) ? "\033[38;2;255;80;80mmiss" : "\033[38;2;100;250;100mhit");
+        if (lastp[0]) printf("\033[21;3Hlast forecast %s, live was %s %s", lastp, lasta, strcmp(lastp, lasta) ? "\033[38;2;255;80;80mmiss" : "\033[38;2;100;250;100mhit");
         printf("\033[0m");
         fflush(stdout);
         for (int i = 0; i < 20 && !stop; i++) usleep(100000);
