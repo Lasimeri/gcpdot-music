@@ -1025,7 +1025,7 @@ static void draw_disc(int row, int col, int d, unsigned rgb, unsigned bg) {
 
 static int cmd_show(void) {
     char p[700]; snprintf(p, sizeof p, "%s/dots", statedir);
-    printf("\033]0;GCP dot\007\033[?25l");   /* the window title (the KWin rule matches it), cursor off */
+    printf("\033]0;GCP dot\007\033[?25l\033[?7l");   /* the window title (gcpdot-show finds the window by it), cursor off, no line wrap: an overlong line is cut, it never scrolls the display */
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     const unsigned bg = 0x0A0A0F;
     while (!stop) {
@@ -1061,18 +1061,18 @@ static int cmd_show(void) {
         /* the two dots */
         int pb = havep ? top_of(pred) : -1;
         draw_disc(3, 3, 12, gcp >= 0 ? colour_of(gcp) : 0x333333, bg);
-        draw_disc(3, 20, 12, pb >= 0 ? colour_of(band_mid[pb]) : 0x333333, bg);
+        draw_disc(3, 27, 12, pb >= 0 ? colour_of(band_mid[pb]) : 0x333333, bg);
         printf("\033[48;2;10;10;15m\033[38;2;220;220;220m");
         printf("\033[10;3H live %s", gcp >= 0 ? "" : "-");
         if (gcp >= 0) printf("%.3f %s", gcp, band_name[band_of(gcp)]);
-        printf("\033[10;20H forecast ");
+        printf("\033[10;27Hforecast ");
         if (pb >= 0) printf("%s %.0f%%", band_name[pb], 100 * pred[pb]); else printf("-");
         { time_t lt = latest; char lm[8]; strftime(lm, sizeof lm, "%H:%M", localtime(&lt));
           printf("\033[11;3H\033[38;2;138;106;62m%s, %ld min old", latest ? lm : "-", latest ? (now - latest) / 60 : 0); }
         if (pb >= 0) {
             /* the GCP minute it is for (it resolves when that minute arrives) */
             time_t tt = pred_at; char hm[8]; strftime(hm, sizeof hm, "%H:%M", localtime(&tt));
-            printf("\033[11;20Hfor %s", hm);
+            printf("\033[11;27Hfor %s", hm);
             /* The change alert: a band other than the live one at 0.6 or
              * more by that minute (the balanced point of the backtest: at
              * 2 min, 84% of changes caught, 84% of alerts right). */
@@ -1110,7 +1110,7 @@ static int cmd_show(void) {
         fflush(stdout);
         for (int i = 0; i < 20 && !stop; i++) usleep(100000);
     }
-    printf("\033[0m\033[?25h\033[2J\033[H");
+    printf("\033[0m\033[?25h\033[?7h\033[2J\033[H");
     return 0;
 }
 

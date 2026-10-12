@@ -140,7 +140,7 @@ not counted. `gcpdot-music score` prints the totals.
 
 ## The display
 
-`gcpdot-show [OUTPUT]` opens `gcpdot-music show` in a small Alacritty window (44 x 22; Konsole when there
+`gcpdot-show [OUTPUT]` opens `gcpdot-music show` in a small Alacritty window (52 x 24; Konsole when there
 is no Alacritty) and moves it to the bottom-right corner of OUTPUT (default DP-2) with a one-shot KWin
 script. It shows the live GCP 2.0 dot and its forecast for the next song (the same live dot), in the old
 gcpdot's colours, the forecast per band,
