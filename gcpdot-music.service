@@ -1,0 +1,11 @@
+[Unit]
+Description=gcpdot-music: the next song in VLC chosen by where the old GCP dot would be (Jev forecast)
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/gcpdot-music
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
