@@ -1,5 +1,6 @@
 # global-mood-ring
-\n(The program and its user service keep the name `gcpdot-music`; the display is `gcpdot-show`.)
+
+(The program and its user service keep the name `gcpdot-music`; the display is `gcpdot-show`.)
 
 The next song in VLC chosen by where the old [GCP dot](https://global-mind.org/gcpdot/) would be, with
 Intel Phi Jev forecasting where it is going.
