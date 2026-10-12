@@ -1,0 +1,241 @@
+ `dots`, `busy`, `status`, `queued` ---
+ `dots`, `busy`, `status`, `queued` tags:
+ `dots`, `busy`, `status`, `queued`   - gcp
+ `dots`, `busy`, `status`, `queued`   - jev
+ `dots`, `busy`, `status`, `queued`   - music
+ `dots`, `busy`, `status`, `queued`   - architecture
+ `dots`, `busy`, `status`, `queued` status: live
+ `dots`, `busy`, `status`, `queued` repo: https://github.com/Lasimeri/global-mood-ring
+ `dots`, `busy`, `status`, `queued` service: gcpdot-music.service (user)
+ `dots`, `busy`, `status`, `queued` created: 2026-10-12
+ `dots`, `busy`, `status`, `queued` updated: 2026-10-12
+ `dots`, `busy`, `status`, `queued` ---
+ `dots`, `busy`, `status`, `queued` # GCP Dot Music - Architecture
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` The next song in VLC is chosen by where the [GCP dot](https://global-mind.org/gcpdot/) will be when the playing song ends. Repo: `~/global-mood-ring` → [github.com/Lasimeri/global-mood-ring](https://github.com/Lasimeri/global-mood-ring) (public; renamed from gcpdot-music 2026-10-12). State as of commit `e022d87`.
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` > [!info] Two sources, one switch
+ `dots`, `busy`, `status`, `queued` > `source=local` (in use since 2026-10-12 13:46): the dot is rebuilt from **this PC's RDSEED** (the reference egg) with GCP 1.0's math, under a second late, no network. `source=gcp`: the dot from **GCP 2.0's network** (gcp2.net netvar), 2.5 to 4 minutes late and rate limited on one shared public token. RDSEED also draws the band and the song.
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ---
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ## At a glance
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ```
+ `dots`, `busy`, `status`, `queued` ╔═ OUTSIDE THIS PC: gcp2.net (read only with source=gcp) ══════════════════════════════════════╗
+ `dots`, `busy`, `status`, `queued` ║  getNetVarAggregate24H, one public bearer token (api_token.js), "Too Many Attempts." waited  ║
+ `dots`, `busy`, `status`, `queued` ╚═══════════════════════════════════════════════╤══════════════════════════════════════════════╝
+ `dots`, `busy`, `status`, `queued`                                                 │ every 2 min and on each song change           
+ `dots`, `busy`, `status`, `queued`                                                 │ (minutes arrive 2.5 to 4 min late)            
+ `dots`, `busy`, `status`, `queued` ╔═ DESKTOP: Ryzen 7 5800X, RTX 3090 Ti ═════════╪══════════════════════════════════════════════╗
+ `dots`, `busy`, `status`, `queued` ║  ┌─ gcpdot-music.service (C daemon, loop 5 s) ─▼─────────────────────────────────────────┐   ║
+ `dots`, `busy`, `status`, `queued` ║  │ series   local: egg minutes (RDSEED, 1 trial/s, mean z^2 a minute, under 1 min late)  │   ║
+ `dots`, `busy`, `status`, `queued` ║  │          gcp:   GCP 2.0 netvar minutes, 7 days kept                                   │   ║
+ `dots`, `busy`, `status`, `queued` ║  │ dot      local: exact chi-square of 1 h / 2 h summed z^2; gcp: rank of window means   │   ║
+ `dots`, `busy`, `status`, `queued` ║  │ bands    red <0.05 orange <0.10 yellow <0.40 green <0.90 teal <0.95 blue              │   ║
+ `dots`, `busy`, `status`, `queued` ║  │ forecast local: future minutes chi2(60 h); gcp: AR(2) netvar, windows rebuilt         │   ║
+ `dots`, `busy`, `status`, `queued` ║  │ song start: provisional next song; 60 s before the end: final forecast, redraw        │   ║
+ `dots`, `busy`, `status`, `queued` ║  │   blend Jev^a x forecast^c (refit on scored targets) -> band, song by RDSEED          │   ║
+ `dots`, `busy`, `status`, `queued` ║  │ every new minute: 2-minute alert, scored live (alerts-local.tsv)                      │   ║
+ `dots`, `busy`, `status`, `queued` ║  └──────┬──────────────────────────┬─────────────────────────────┬───────────────────────┘   ║
+ `dots`, `busy`, `status`, `queued` ║         │ mjev query, 35 s limit   │ AddTrack at the bottom      │ dots, every loop          ║
+ `dots`, `busy`, `status`, `queued` ║         ▼                          ▼                             ▼                           ║
+ `dots`, `busy`, `status`, `queued` ║  ┌─ xks :8090, cuda site ───┐  ┌─ VLC (MPRIS) ────────────┐  ┌─ gcpdot-show 52 x 32 ──────┐  ║
+ `dots`, `busy`, `status`, `queued` ║  │ Qwen3.8-35B-A3B Q4_K_M   │  │ (0)MainPL: 21 folders,   │  │ DP-2 bottom-right: dot,    │  ║
+ `dots`, `busy`, `status`, `queued` ║  │ 21 of 41 layers on GPU   │  │ 6 bands; skips, replays  │  │ forecast, alert, hit log   │  ║
+ `dots`, `busy`, `status`, `queued` ║  │ about 12.6 s a question  │  │ weigh the song draw      │  │                            │  ║
+ `dots`, `busy`, `status`, `queued` ║  └──────────────────────────┘  └──────────────────────────┘  └────────────────────────────┘  ║
+ `dots`, `busy`, `status`, `queued` ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ `dots`, `busy`, `status`, `queued` ```
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ---
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ## System overview
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ```mermaid
+ `dots`, `busy`, `status`, `queued` graph TB
+ `dots`, `busy`, `status`, `queued`     subgraph ext["Outside this PC (source=gcp only)"]
+ `dots`, `busy`, `status`, `queued`         GCP2["gcp2.net API<br/>getNetVarAggregate24H<br/>one public token, rate limited"]
+ `dots`, `busy`, `status`, `queued`     end
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued`     subgraph pc["Desktop: Ryzen 7 5800X, RTX 3090 Ti"]
+ `dots`, `busy`, `status`, `queued`         RD[("RDSEED<br/>1 trial/s, 200 bits")]
+ `dots`, `busy`, `status`, `queued`         D["gcpdot-music.service<br/>C daemon, loop every 5 s"]
+ `dots`, `busy`, `status`, `queued`         J["Intel Phi Jev<br/>mjev → xks :8090, cuda site<br/>Qwen3.8-35B-A3B Q4_K_M<br/>21 of 41 layers on the 3090 Ti"]
+ `dots`, `busy`, `status`, `queued`         V["VLC<br/>MPRIS TrackList"]
+ `dots`, `busy`, `status`, `queued`         M[("(0)MainPL<br/>21 genre folders → 6 bands")]
+ `dots`, `busy`, `status`, `queued`         S[("~/.local/state/gcpdot-music")]
+ `dots`, `busy`, `status`, `queued`         W["gcpdot-show<br/>Alacritty 52x32, bottom-right of DP-2"]
+ `dots`, `busy`, `status`, `queued`     end
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued`     GCP2 -->|"every 2 min, each song change"| D
+ `dots`, `busy`, `status`, `queued`     RD -->|"egg minutes (local series), draws"| D
+ `dots`, `busy`, `status`, `queued`     D <-->|"Choice: band at the target minute"| J
+ `dots`, `busy`, `status`, `queued`     M --> D
+ `dots`, `busy`, `status`, `queued`     D -->|"AddTrack at the bottom"| V
+ `dots`, `busy`, `status`, `queued`     V -->|"track id, position"| D
+ `dots`, `busy`, `status`, `queued`     D --> S
+ `dots`, `busy`, `status`, `queued`     S -->|"dots, busy"| W
+ `dots`, `busy`, `status`, `queued` ```
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ---
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ## The dot
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ```mermaid
+ `dots`, `busy`, `status`, `queued` graph LR
+ `dots`, `busy`, `status`, `queued`     subgraph local["source=local: exact"]
+ `dots`, `busy`, `status`, `queued`         T["1 trial/s<br/>200 RDSEED bits"] --> Z["z = (trial - 100) / sqrt(50)<br/>mean z² per minute"]
+ `dots`, `busy`, `status`, `queued`         Z --> C1["sum z² over 1 h<br/>vs chi-square, df = trials"]
+ `dots`, `busy`, `status`, `queued`         Z --> C2["sum z² over 2 h<br/>vs chi-square, df = trials"]
+ `dots`, `busy`, `status`, `queued`         C1 --> Y{"farther from 0.5"}
+ `dots`, `busy`, `status`, `queued`         C2 --> Y
+ `dots`, `busy`, `status`, `queued`     end
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued`     subgraph gcp["source=gcp: empirical"]
+ `dots`, `busy`, `status`, `queued`         NV["netvar per minute<br/>lag-1 autocorrelation 0.964"] --> R1["rank of the 1 h mean<br/>among past windows"]
+ `dots`, `busy`, `status`, `queued`         NV --> R2["same for 2 h"]
+ `dots`, `busy`, `status`, `queued`         R1 --> X{"farther from 0.5"}
+ `dots`, `busy`, `status`, `queued`         R2 --> X
+ `dots`, `busy`, `status`, `queued`     end
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued`     Y --> B["bands<br/>red under 0.05 · orange 0.05-0.10<br/>yellow 0.10-0.40 · green 0.40-0.90<br/>teal 0.90-0.95 · blue over 0.95"]
+ `dots`, `busy`, `status`, `queued`     X --> B
+ `dots`, `busy`, `status`, `queued` ```
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` > [!note] Why the two are computed differently
+ `dots`, `busy`, `status`, `queued` > The egg's minutes are independent, so a window's summed z² is exactly chi-square: the original dot's math. GCP 2.0's minute values are a rolling statistic, not a chi-square, so they are ranked; control: the 1 h index alone gives 5.0 / 5.0 / 30.0 / 50.0 / 5.0 / 5.1 % per band. The egg's dot crosses band edges four to five times as often as GCP's smoothed one.
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ---
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ## One song decision
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ```mermaid
+ `dots`, `busy`, `status`, `queued` sequenceDiagram
+ `dots`, `busy`, `status`, `queued`     participant V as VLC
+ `dots`, `busy`, `status`, `queued`     participant D as Daemon
+ `dots`, `busy`, `status`, `queued`     participant J as Jev (35B, GPU)
+ `dots`, `busy`, `status`, `queued`     participant R as RDSEED
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued`     V->>D: a song starts
+ `dots`, `busy`, `status`, `queued`     D->>D: forecast for the minute it ends (a whole song ahead)
+ `dots`, `busy`, `status`, `queued`     D->>V: provisional next song, AddTrack at the bottom (P line)
+ `dots`, `busy`, `status`, `queued`     V->>D: position every 5 s
+ `dots`, `busy`, `status`, `queued`     Note over D: 60 s before the song ends (DECIDE_S)
+ `dots`, `busy`, `status`, `queued`     D->>D: target = last minute closed when the song ends (local)<br/>or newest + time left (gcp)
+ `dots`, `busy`, `status`, `queued`     D->>D: exact forecast for the target (local) / AR(2) rebuild (gcp)
+ `dots`, `busy`, `status`, `queued`     D->>J: series, dot, last 8 resolved forecasts, the forecast as a suggestion
+ `dots`, `busy`, `status`, `queued`     Note over D,J: limit: time left minus 25 s (35 s); median 12.6 s
+ `dots`, `busy`, `status`, `queued`     J-->>D: probabilities for the 6 bands
+ `dots`, `busy`, `status`, `queued`     D->>D: blend = Jev^a × forecast^c
+ `dots`, `busy`, `status`, `queued`     D->>R: draw the band again from the final blend
+ `dots`, `busy`, `status`, `queued`     alt same band as the provisional song
+ `dots`, `busy`, `status`, `queued`         D->>D: keep it
+ `dots`, `busy`, `status`, `queued`     else another band
+ `dots`, `busy`, `status`, `queued`         D->>V: RemoveTrack the provisional one
+ `dots`, `busy`, `status`, `queued`         D->>R: draw a song in the new band (skip and replay weights)
+ `dots`, `busy`, `status`, `queued`     end
+ `dots`, `busy`, `status`, `queued`     D->>V: AddTrack after the highest playlist id (when replaced)
+ `dots`, `busy`, `status`, `queued`     D->>D: Q line with the target minute (scored)
+ `dots`, `busy`, `status`, `queued`     V->>D: the song starts: S line (dot then)
+ `dots`, `busy`, `status`, `queued` ```
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` Verified live 2026-10-12: decided at 14:29:40 with 1.0 min left, Jev answered in about 10 s, queued 14:29:50, target 14:30 (the minute closed when the song ended).
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ---
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ## Forecast and learning
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ```mermaid
+ `dots`, `busy`, `status`, `queued` graph TD
+ `dots`, `busy`, `status`, `queued`     TGT["target minute"] --> F["forecast<br/>local: future minutes chi2(60 h), 21 quantiles<br/>gcp: AR(2) netvar, windows rebuilt"]
+ `dots`, `busy`, `status`, `queued`     TGT --> JV["Jev<br/>sees its own recent misses"]
+ `dots`, `busy`, `status`, `queued`     F --> JV
+ `dots`, `busy`, `status`, `queued`     F --> BL["blend<br/>Jev^a × forecast^c"]
+ `dots`, `busy`, `status`, `queued`     JV --> BL
+ `dots`, `busy`, `status`, `queued`     BL --> DR["band draw (RDSEED)"]
+ `dots`, `busy`, `status`, `queued`     BL --> Q[("Q line: forecast + target")]
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued`     NEW["new minutes"] --> RES{"target minute<br/>in the series?"}
+ `dots`, `busy`, `status`, `queued`     Q --> RES
+ `dots`, `busy`, `status`, `queued`     RES -->|"yes"| SC["score on that minute's dot"]
+ `dots`, `busy`, `status`, `queued`     SC --> FIT["refit a, c<br/>lowest mean log loss, grid 0..2"]
+ `dots`, `busy`, `status`, `queued`     FIT --> BL
+ `dots`, `busy`, `status`, `queued`     SC --> JV
+ `dots`, `busy`, `status`, `queued` ```
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` > [!tip] Local forecast: calibrated, so at the ceiling (`gcpdot-music mech H`, 0.4 days)
+ `dots`, `busy`, `status`, `queued` > | Ahead | Right | Persistence | Expected (own) | Log loss |
+ `dots`, `busy`, `status`, `queued` > |---|---|---|---|---|
+ `dots`, `busy`, `status`, `queued` > | 1 min | 85.6% | 83.1% | 85.4% | 0.285 |
+ `dots`, `busy`, `status`, `queued` > | 2 min | 83.0% | 74.8% | 81.4% | 0.378 |
+ `dots`, `busy`, `status`, `queued` > | 3 min | 78.0% | 68.6% | 78.0% | 0.498 |
+ `dots`, `busy`, `status`, `queued` > | 4 min | 77.2% | 67.1% | 76.5% | 0.539 |
+ `dots`, `busy`, `status`, `queued` > | 5 min | 72.8% | 65.2% | 73.6% | 0.610 |
+ `dots`, `busy`, `status`, `queued` >
+ `dots`, `busy`, `status`, `queued` > Its expected accuracy matches the realized one; finer quantiles or a smaller floor move nothing beyond one event. The only lever is the horizon, hence the decision 60 s before the song ends (a whole song is about 3.5 min ahead).
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` > [!tip] GCP forecast (about 1.3 days)
+ `dots`, `busy`, `status`, `queued` > 2 min: 97.8% right (persistence 94.5%), changes caught 88.4%, log loss 0.062. 5 min: 95.7% (86.8%), 86.5%, 0.108. Last value, trend, veridical mapping, hypo-priors, time of day and the AR(2)+veridical average all tie AR(2) within one or two events. The blend settled at Jev^0 × forecast^1.25.
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` > [!warning] Timing
+ `dots`, `busy`, `status`, `queued` > Each forecast is pinned to one minute and scored only when it arrives. With the old song-start scoring, 4 of 96 forecasts were judged against another band (3 false hits). In local mode the old target (newest + rounded time left) was a minute off in 3 of 9 songs; it is now the minute closed when the song ends.
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ---
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ## The 2-minute alert
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ```mermaid
+ `dots`, `busy`, `status`, `queued` graph LR
+ `dots`, `busy`, `status`, `queued`     NM["each new minute"] --> FC["forecast 2 min ahead"]
+ `dots`, `busy`, `status`, `queued`     FC --> LOG[("alerts-local.tsv / alerts.tsv")]
+ `dots`, `busy`, `status`, `queued`     FC --> TH{"P(change) ≥ 0.5 local<br/>≥ 0.6 gcp"}
+ `dots`, `busy`, `status`, `queued`     TH -->|"yes"| AL["alert on the display"]
+ `dots`, `busy`, `status`, `queued`     LOG --> SCR["scored when the minute arrives"]
+ `dots`, `busy`, `status`, `queued`     SCR --> REC["last 24 h: right %, hits, misses,<br/>false alarms, latest 5 events"]
+ `dots`, `busy`, `status`, `queued` ```
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` Local at 0.5: 55% of changes caught, 67% of alerts right (backtest, 40 changes); at 0.4, 65% and 61%. The horizon is fixed by the definition, so the threshold only trades hits against false alarms. One switch can be counted by two alerts made a minute apart.
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ---
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ## Skips and replays
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ```mermaid
+ `dots`, `busy`, `status`, `queued` graph LR
+ `dots`, `busy`, `status`, `queued`     P["poll VLC every 5 s<br/>track id, position"] --> CH{"track changed?"}
+ `dots`, `busy`, `status`, `queued`     CH -->|"yes, over 15 s were left<br/>(position carried on by elapsed time)"| SK["skip"]
+ `dots`, `busy`, `status`, `queued`     CH -->|"yes, played in the last 50"| RP["replay"]
+ `dots`, `busy`, `status`, `queued`     CH -->|"no, position jumped back over 10 s"| RP
+ `dots`, `busy`, `status`, `queued`     SK --> PR[("prefs.tsv")]
+ `dots`, `busy`, `status`, `queued`     RP --> PR
+ `dots`, `busy`, `status`, `queued`     PR --> WT["weight in the band's draw<br/>exp(0.6 replays - 0.8 skips), at least 0.05"]
+ `dots`, `busy`, `status`, `queued` ```
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ---
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ## Files
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` | Path | What |
+ `dots`, `busy`, `status`, `queued` |---|---|
+ `dots`, `busy`, `status`, `queued` | `~/.config/gcpdot-music/bands.conf` | root, `switch=next/now`, `jev=on/off`, `source=gcp/local`, folders per band |
+ `dots`, `busy`, `status`, `queued` | `~/.config/xks/xks.conf` | `XKS_SYSTEM_FILE=~/CLAUDE.md`, `XKS_SITE=cuda`, `XKS_GPU_LAYERS=50%` |
+ `dots`, `busy`, `status`, `queued` | `~/.local/state/gcpdot-music/netvar.tsv` | GCP 2.0 minutes, up to 7 days |
+ `dots`, `busy`, `status`, `queued` | `egg-YYYYMMDD.tsv`, `egg-min.tsv` | the egg: raw trials, minutes (the local series) |
+ `dots`, `busy`, `status`, `queued` | `predictions[-local].tsv` | `Q` final forecasts (target minute last, scored), `P` provisional ones, `S` song starts, `K` skips, `R` replays |
+ `dots`, `busy`, `status`, `queued` | `alerts[-local].tsv` | every 2-minute alert: made, target, band then, six probabilities |
+ `dots`, `busy`, `status`, `queued` | `prefs.tsv` | skips and replays per song |
+ `dots`, `busy`, `status`, `queued` | `compare.tsv` | GCP dot vs egg dot per minute (gcp source) |
+ `dots`, `busy`, `status`, `queued` | `dots`, `busy`, `status`, `queued` | what the display reads; what the loop waits on; status; the queued song |
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ## Commands
+ `dots`, `busy`, `status`, `queued` 
+ `dots`, `busy`, `status`, `queued` ```
+ `dots`, `busy`, `status`, `queued` systemctl --user enable --now gcpdot-music   # off: systemctl --user disable --now gcpdot-music
+ `dots`, `busy`, `status`, `queued` gcpdot-show                                   # the display, bottom-right of the left monitor
+ `dots`, `busy`, `status`, `queued` gcpdot-music start                            # start the playlist from the dot's band now
+ `dots`, `busy`, `status`, `queued` gcpdot-music score                            # resolved forecasts, the live alert record, skips, replays
+ `dots`, `busy`, `status`, `queued` gcpdot-music mech H [METHOD]                  # forecast backtest H minutes ahead, with calibration
+ `dots`, `busy`, `status`, `queued` gcpdot-music compare                          # GCP dot vs this PC's egg, last 24 h
+ `dots`, `busy`, `status`, `queued` gcpdot-music dot | status
+ `dots`, `busy`, `status`, `queued` ```

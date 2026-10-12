@@ -38,7 +38,8 @@ Phi Jev say where it is going.
 
 - **The series.** `source=local`: the reference egg, one trial a second from the CPU's RDSEED (the sum
   of 200 bits, z = (trial - 100)/sqrt(50)), one value a minute (the mean z^2 of its trials), closed
-  under a second late; minutes with fewer than 30 trials (a restart) are left out. `source=gcp`: GCP
+  under a second late; every minute counts with its own number of trials (a restart's partial minute
+  too). `source=gcp`: GCP
   2.0's network variance from gcp2.net (`/api/getNetVarAggregate24H`, one value a minute), read every
   2 minutes and on each song change, 2.5 to 4 minutes late, kept up to 7 days. gcp2.net rate-limits its
   one public token ("Too Many Attempts.", shared with every visitor); such answers are waited out (5, 15,
@@ -156,12 +157,13 @@ daemon's own cuts (`switch=now`) are not counted.
 
 `gcpdot-show [OUTPUT]` opens `gcpdot-music show` in an Alacritty window (52 x 32; Konsole when there is
 no Alacritty) and moves it to the bottom-right corner of OUTPUT (default DP-2) with a one-shot KWin
-script. It reads `~/.local/state/gcpdot-music/dots`, which the daemon rewrites every loop:
+script, kept above other windows. It reads `~/.local/state/gcpdot-music/dots`, which the daemon
+rewrites every loop:
 
 - the source, the live dot and its minute's age, and the forecast dot for the song's target minute (the
   2-minute forecast when there is no song forecast or its minute has passed), in the old gcpdot's colours;
-- the change alert, the forecast per band, and the reference line (local: the egg's own chi-square
-  check; GCP: this PC's egg as a control);
+- the change alert, the forecast per band, and the RNG line (local: the RNG readout, its dot with the
+  trials in the last minute, their mean z^2 and the last z; GCP: this PC's egg as a control);
 - the last forecast's hit or miss, the live alert record, and the band-change log: hits and misses over
   the last 24 h's changes, false alarms over its alerts, and the latest five events, newest first.
 

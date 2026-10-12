@@ -484,12 +484,13 @@ static long egg_latest(void) { pthread_mutex_lock(&emu); long m = esn ? emin[esn
  * trials that minute (GCP 1.0's per-second netvar for a one-egg network,
  * averaged), appended as each minute closes (under a minute late, against
  * GCP 2.0's 2.5 to 4 minutes and its rate limit). GCP is not read then. A
- * minute with fewer than 30 trials (a restart) is left out. */
+ * minute counts with its own number of trials (a restart's partial minute
+ * too), so the dot is the egg's own chi-square index exactly. */
 static int local_sync(void) {
     int added = 0;
     pthread_mutex_lock(&emu);
     for (int i = 0; i < esn; i++) {
-        if (en[i] < 30 || (sn && emin[i] <= sep[sn - 1])) continue;
+        if (en[i] < 1 || (sn && emin[i] <= sep[sn - 1])) continue;
         if (sn == MAXMIN) { memmove(sep, sep + 1, (MAXMIN - 1) * sizeof *sep); memmove(sval, sval + 1, (MAXMIN - 1) * sizeof *sval); memmove(scount, scount + 1, (MAXMIN - 1) * sizeof *scount); sn--; }
         sep[sn] = emin[i]; sval[sn] = ez2[i] / en[i]; scount[sn] = en[i]; sn++; added++;
     }
@@ -1116,6 +1117,11 @@ static void write_dots(double gcp, double ref, const double pf[NBANDS], int have
     if (!f) return;
     fprintf(f, "time=%ld\ngcp=%.4f\nlatest_minute=%ld\nref=%.4f\n", (long) time(NULL), gcp, sn ? sep[sn - 1] : 0L, ref);
     fprintf(f, "source=%s\n", src_local ? "local" : "gcp");
+    /* the RNG readout: trials in the last closed minute and their mean z^2,
+     * the last trial's z, trials since the daemon started */
+    pthread_mutex_lock(&emu);
+    if (esn) fprintf(f, "rng=%d %.4f %+.3f %ld\n", en[esn - 1], ez2[esn - 1] / (en[esn - 1] ? en[esn - 1] : 1), egg_last_z, egg_trials);
+    pthread_mutex_unlock(&emu);
     if (have_pred) {
         fprintf(f, "pred_at=%ld\npred_src=%s\npred=", pred_at, pred_src_jev ? "Jev + rebuilt dot" : "rebuilt dot");
         for (int b = 0; b < NBANDS; b++) fprintf(f, "%s%.4f", b ? " " : "", pf[b]);
@@ -1160,6 +1166,7 @@ static int cmd_show(void) {
         double gcp = -1, ref = -1, pred[NBANDS] = { 0 }; long t = 0, latest = 0, pred_at = 0; int havep = 0;
         char src[32] = "", lastp[16] = "", lasta[16] = ""; long last_tgt = 0, alert_at2 = 0; double al[NBANDS] = { 0 }; int haveal = 0;
         char srcmode[16] = "gcp";
+        int rng_n = -1; double rng_z2 = 0, rng_z = 0; long rng_tot = 0;   /* the RNG readout */
         int ln = 0, lok = 0, lch = 0, lcaught = 0, lcalls = 0, lcallok = 0; double lll = 0;
         struct cev ev[NCEV]; int nev = 0;
         FILE *f = fopen(p, "r");
@@ -1172,6 +1179,7 @@ static int cmd_show(void) {
                 if (sscanf(line, "last_target=%ld", &last_tgt) == 1 || sscanf(line, "last_pred=%15s", lastp) == 1 || sscanf(line, "last_actual=%15s", lasta) == 1) continue;
                 if (sscanf(line, "alert_at=%ld", &alert_at2) == 1) continue;
                 if (sscanf(line, "source=%15s", srcmode) == 1) continue;
+                if (sscanf(line, "rng=%d %lf %lf %ld", &rng_n, &rng_z2, &rng_z, &rng_tot) == 4) continue;
                 if (sscanf(line, "live=%d %d %d %d %d %d %lf", &ln, &lok, &lch, &lcaught, &lcalls, &lcallok, &lll) == 7) continue;
                 if (nev < NCEV && sscanf(line, "event=%ld %d %d %d %d %lf", &ev[nev].target, &ev[nev].nb, &ev[nev].act, &ev[nev].call, &ev[nev].ob, &ev[nev].pc) == 6) { if (ev[nev].nb >= 0 && ev[nev].nb < NBANDS && ev[nev].act >= 0 && ev[nev].act < NBANDS && ev[nev].ob >= 0 && ev[nev].ob < NBANDS) nev++; continue; }
                 if (!strncmp(line, "alert=", 6)) { haveal = sscanf(line + 6, "%lf %lf %lf %lf %lf %lf", &al[0], &al[1], &al[2], &al[3], &al[4], &al[5]) == 6; continue; }
@@ -1235,9 +1243,12 @@ static int cmd_show(void) {
             }
             printf("\033[19;3H\033[38;2;138;106;62m%s", src);
         }
-        printf("\033[20;3H\033[38;2;150;150;150m%s", local ? "exact chi-square check " : "this PC (reference) ");
+        /* local: the RNG readout (its dot is the live one); GCP: this PC's
+         * egg as a control */
+        printf("\033[20;3H\033[38;2;150;150;150m%s", local ? "RNG " : "this PC (reference) ");
         if (ref >= 0) { unsigned c = colour_of(ref); printf("\033[38;2;%u;%u;%um●\033[38;2;150;150;150m %.3f %s", c >> 16, (c >> 8) & 255, c & 255, ref, band_name[band_of(ref)]); }
         else printf("warming up");
+        if (local && rng_n >= 0) printf("  %d/min z2 %.2f z %+.1f", rng_n, rng_z2, rng_z);
         char ltm[8] = "-"; if (last_tgt) { time_t tt2 = last_tgt; strftime(ltm, sizeof ltm, "%H:%M", localtime(&tt2)); }
         if (lastp[0]) printf("\033[21;3Hlast %s: forecast %s, live %s %s", ltm, lastp, lasta, strcmp(lastp, lasta) ? "\033[38;2;255;80;80mmiss" : "\033[38;2;100;250;100mhit");
         /* the alert's live record, last 24 h */

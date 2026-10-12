@@ -2,7 +2,7 @@
 # gcpdot-show: the GCP dot display (gcpdot-music show) in a small terminal
 # window (Alacritty, 52 x 32, else Konsole), moved to the bottom-right
 # corner of an output (default DP-2, the left monitor) by a one-shot KWin
-# script once its title reads "GCP dot".
+# script once its title reads "GCP dot", kept above other windows.
 #   gcpdot-show [OUTPUT]
 out=${1:-DP-2}
 w=0 h=0
@@ -25,6 +25,7 @@ if (area) for (const win of workspace.windowList()) {
     if (win.caption.indexOf("GCP dot") === 0) {
         const g = win.frameGeometry, W = fw || g.width, H = fh || g.height;
         win.frameGeometry = { x: area.x + area.width - W, y: area.y + area.height - H, width: W, height: H };
+        win.keepAbove = true;   // never under another window (a terminal above it hid its top rows)
     }
 }
 JS
