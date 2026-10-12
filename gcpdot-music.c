@@ -1140,14 +1140,17 @@ static double rank_sum(int w, int end, double cur) {
 }
 /* Netvar forecasts for the H minutes after minute T (index, inclusive):
  * 0 last value held, 1 the 5-minute trend carried on, 2 AR(2) on the
- * minute-to-minute changes fitted on the minutes up to T. */
-static void nv_forecast(int method, int t, int h, double *out) {
-    if (method == 3) { for (int k = 0; k < h; k++) out[k] = t + 1 + k < sn ? sval[t + 1 + k] : sval[sn - 1]; return; }   /* the oracle: the actual minutes (backtest check only) */
-    if (method == 0 || t < 6) { for (int k = 0; k < h; k++) out[k] = sval[t]; return; }
-    if (method == 1) { double s = (sval[t] - sval[t - 5]) / 5; for (int k = 0; k < h; k++) out[k] = sval[t] + (k + 1) * s; return; }
-    /* AR(2) on d_i = x_i - x_(i-1): least squares over the last 600 changes */
+ * minute-to-minute changes fitted on the last 600 minutes up to T,
+ * 4 veridical mapping (after Mottron's model of autistic pattern detection:
+ * the exact shape of the last 10 changes matched against all of history,
+ * the changes that followed the 15 closest matches averaged), 5 AR(2) with
+ * hypo-priors (after Pellicano and Burr: fitted on the last 120 minutes
+ * only, fresh evidence over the long-run prior), 6 AR(2) as 2 with its
+ * error spread taken from the same hours of the day (GCP: the effect size
+ * varies with time of day). */
+static void ar2(int t, int h, int win, double *out) {
     double s11 = 0, s12 = 0, s22 = 0, b1 = 0, b2 = 0;
-    for (int i = (t > 603 ? t - 600 : 3); i <= t; i++) {
+    for (int i = (t > win + 3 ? t - win : 3); i <= t; i++) {
         double d = sval[i] - sval[i - 1], d1 = sval[i - 1] - sval[i - 2], d2 = sval[i - 2] - sval[i - 3];
         s11 += d1 * d1; s12 += d1 * d2; s22 += d2 * d2; b1 += d * d1; b2 += d * d2;
     }
@@ -1155,6 +1158,35 @@ static void nv_forecast(int method, int t, int h, double *out) {
     if (fabs(det) > 1e-12) { a1 = (b1 * s22 - b2 * s12) / det; a2 = (b2 * s11 - b1 * s12) / det; }
     double x = sval[t], d1 = sval[t] - sval[t - 1], d2 = sval[t - 1] - sval[t - 2];
     for (int k = 0; k < h; k++) { double d = a1 * d1 + a2 * d2; x += d; out[k] = x; d2 = d1; d1 = d; }
+}
+#define VM_M 10
+#define VM_K 15
+static void veridical(int t, int h, double *out) {
+    double bd[VM_K]; int bs[VM_K], nb = 0;
+    for (int s = VM_M + 1; s + h <= t; s++) {
+        double dist = 0;
+        for (int j = 0; j < VM_M && dist < 1e300; j++) {
+            double a = sval[s - j] - sval[s - j - 1], b = sval[t - j] - sval[t - j - 1];
+            dist += (a - b) * (a - b);
+        }
+        if (nb < VM_K) { bd[nb] = dist; bs[nb] = s; nb++; continue; }
+        int worst = 0; for (int k = 1; k < VM_K; k++) if (bd[k] > bd[worst]) worst = k;
+        if (dist < bd[worst]) { bd[worst] = dist; bs[worst] = s; }
+    }
+    double x = sval[t];
+    for (int k = 0; k < h; k++) {
+        double d = 0;
+        for (int q = 0; q < nb; q++) d += sval[bs[q] + 1 + k] - sval[bs[q] + k];
+        x += nb ? d / nb : 0;
+        out[k] = x;
+    }
+}
+static void nv_forecast(int method, int t, int h, double *out) {
+    if (method == 3) { for (int k = 0; k < h; k++) out[k] = t + 1 + k < sn ? sval[t + 1 + k] : sval[sn - 1]; return; }   /* the oracle: the actual minutes (backtest check only) */
+    if (method == 0 || t < 6) { for (int k = 0; k < h; k++) out[k] = sval[t]; return; }
+    if (method == 1) { double s = (sval[t] - sval[t - 5]) / 5; for (int k = 0; k < h; k++) out[k] = sval[t] + (k + 1) * s; return; }
+    if (method == 4 && t > VM_M + 30) { veridical(t, h, out); return; }
+    ar2(t, h, method == 5 ? 120 : 600, out);
 }
 /* The dot H minutes after minute T, from the known minutes and FUT (the
  * forecast of the next H minutes, summed into each window), ranked against
@@ -1198,11 +1230,23 @@ static double mech_forecast(int method, int t, int h, double p[NBANDS]) {
     if (h > 64) h = 64;
     for (int b = 0; b < NBANDS; b++) p[b] = 0;
     nv_forecast(method, t, h, fut);
-    for (int s = t - h; s >= 130 && ne < 1200; s -= 1) {
-        double f2[64], sf = 0, sa = 0;
-        nv_forecast(method, s, h, f2);
-        for (int k = 0; k < h; k++) { sf += f2[k]; sa += sval[s + 1 + k]; }
-        e[ne++] = sa - sf;
+    /* the veridical matcher is slow: its error history thinned (every 4th
+     * minute, at most 300); method 6 keeps only the same hours of the day
+     * (within 2 h, circular), falling back to all when under 50 */
+    int step = method == 4 ? 4 : 1, cap = method == 4 ? 300 : 1200;
+    for (int pass = 0; pass < 2 && ne < 50; pass++) {
+        ne = 0;
+        for (int s = t - h; s >= 130 && ne < cap; s -= step) {
+            if (method == 6 && !pass) {
+                long dh = labs((sep[s] % 86400) - (sep[t] % 86400)); if (dh > 43200) dh = 86400 - dh;
+                if (dh > 7200) continue;
+            }
+            double f2[64], sf = 0, sa = 0;
+            nv_forecast(method, s, h, f2);
+            for (int k = 0; k < h; k++) { sf += f2[k]; sa += sval[s + 1 + k]; }
+            e[ne++] = sa - sf;
+        }
+        if (method != 6) break;
     }
     double point = mech_dot(t, h, 0, fut);
     if (ne < 50) { if (point >= 0) p[band_of(point)] = 1; return point; }
@@ -1222,7 +1266,7 @@ static double mech_forecast(int method, int t, int h, double p[NBANDS]) {
  * changes it called (precision), and the probabilities' log loss. */
 static int cmd_mech(int h) {
     series_load(); dots_sync(); psum_sync();
-    for (int m = 0; m < 4; m++) {
+    for (int m = 0; m < 7; m++) {
         int n = 0, ok = 0, pok = 0, ch = 0, chok = 0, called = 0, calledok = 0; double ll = 0;
         for (int t = 300; t + h < gdn; t += 2) {
             if (gdot[t] < 0 || gdot[t + h] < 0) continue;
@@ -1234,7 +1278,7 @@ static int cmd_mech(int h) {
             if (act != now_b) { ch++; chok += pr == act; }
             if (pr != now_b) { called++; calledok += pr == act; }
         }
-        static const char *nm[4] = { "last value", "5-min trend", "AR(2) on changes", "ORACLE (actual)" };
+        static const char *nm[7] = { "last value", "5-min trend", "AR(2) on changes", "ORACLE (actual)", "veridical mapping", "AR(2) hypo-priors", "AR(2) + time of day" };
         printf("%d min ahead, netvar by %-17s %d minutes: right %.1f%% (persistence %.1f%%); band changes %d, caught %d (%.1f%%); changes called %d, right %d (%.1f%%); log loss %.3f\n",
                h, nm[m], n, 100.0 * ok / n, 100.0 * pok / n, ch, chok, ch ? 100.0 * chok / ch : 0, called, calledok, called ? 100.0 * calledok / called : 0, ll / n);
     }
