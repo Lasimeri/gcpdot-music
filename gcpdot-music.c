@@ -1541,6 +1541,31 @@ static int cmd_backtest(int h) {
     return 0;
 }
 
+/* Start the playlist: a song from the band the dot is in now (the song
+ * starts at once, so its minute is the newest one, known), drawn as the
+ * daemon draws (RDSEED, skip and replay weights), played in VLC now; the
+ * daemon then queues each next one. */
+static int cmd_start(void) {
+    scan_tracks();
+    series_open();
+    if (!src_local && fetch() < 0) say("the feed did not answer; the minutes kept on disk only");
+    if (sn < 240) { say("only %d minutes of the series", sn); return 1; }
+    double d = dot_now();
+    if (d < 0) { say("no dot yet"); return 1; }
+    int b = band_of(d);
+    prefs_load();
+    const char *t = pick_track(b);
+    if (!t) { say("band %s has no songs", band_name[b]); return 1; }
+    if (sd_bus_open_user(&bus) < 0) { say("no session bus"); return 1; }
+    char *u = uri_of(t);
+    sd_bus_error e = SD_BUS_ERROR_NULL;
+    int r = sd_bus_call_method(bus, PLAYER, MPATH, "org.mpris.MediaPlayer2.Player", "OpenUri", &e, NULL, "s", u);
+    if (r < 0) { say("VLC did not take it: %s (is VLC running?)", e.message ? e.message : strerror(-r)); sd_bus_error_free(&e); free(u); return 1; }
+    sd_bus_error_free(&e); free(u);
+    printf("dot %.3f (%s, %s source): playing %s\n", d, band_name[b], src_local ? "local" : "gcp", t);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     paths();
@@ -1550,6 +1575,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "show")) return cmd_show();
     if (argc > 1 && !strcmp(argv[1], "backtest")) return cmd_backtest(argc > 2 ? atoi(argv[2]) : 4);
     if (argc > 1 && !strcmp(argv[1], "dot")) return cmd_dot();
+    if (argc > 1 && !strcmp(argv[1], "start")) return cmd_start();
     if (argc > 1 && !strcmp(argv[1], "compare")) return cmd_compare();
     if (argc > 1 && !strcmp(argv[1], "status")) {
         char p[700]; snprintf(p, sizeof p, "%s/status", statedir);
@@ -1557,7 +1583,7 @@ int main(int argc, char **argv) {
         char b[4096]; size_t n = fread(b, 1, sizeof b - 1, f); b[n] = 0; fclose(f); fputs(b, stdout);
         return 0;
     }
-    if (argc > 1) { fprintf(stderr, "gcpdot-music [show|dot|compare|score|backtest [MIN]|status]\n"); return 2; }
+    if (argc > 1) { fprintf(stderr, "gcpdot-music [start|show|dot|compare|score|mech H [METHOD]|backtest [MIN]|status]\n"); return 2; }
 
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     load_conf();

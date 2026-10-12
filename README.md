@@ -72,6 +72,7 @@ Phi Jev say where it is going.
 make -j && make install
 systemctl --user enable --now gcpdot-music   # off: systemctl --user disable --now gcpdot-music
 gcpdot-show                                   # the display window (bottom-right of DP-2)
+gcpdot-music start                            # start the playlist: a song from the dot's band now, played at once
 gcpdot-music dot                              # the dot now, band shares, a uniformity control
 gcpdot-music score                            # resolved forecasts, the live alert record, skips, replays
 gcpdot-music mech H [METHOD]                  # backtest of the forecast H minutes ahead
