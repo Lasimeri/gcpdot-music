@@ -401,7 +401,9 @@ static double egg_dot_at(long end) {
 static long egg_latest(void) { pthread_mutex_lock(&emu); long m = esn ? emin[esn - 1] : 0; pthread_mutex_unlock(&emu); return m; }
 
 /* ---- Jev ---- */
-static int ask_jev(double horizon_min, double probs[NBANDS]) {
+/* DEADLINE_S: Jev must answer within it (the song playing ends soon after),
+ * else the caller queues on the dot's band now. */
+static int ask_jev(double horizon_min, int deadline_s, double probs[NBANDS]) {
     if (sn < 120) return -1;
     char state[4096]; int o = 0;
     o += snprintf(state + o, sizeof state - o, "GCP 2.0 global network variance (netvar), the mean of each 10 minutes over the last two hours, oldest first:");
@@ -431,7 +433,7 @@ static int ask_jev(double horizon_min, double probs[NBANDS]) {
     c += snprintf(choice + c, sizeof choice - c, "band=Which band will the gcpdot index be in %.0f minutes from now?|", horizon_min < 1 ? 1 : horizon_min);
     for (int b = 0; b < NBANDS; b++) c += snprintf(choice + c, sizeof choice - c, "%s%s:%s", b ? ";" : "", band_name[b], band_desc[b]);
     char cmd[6000];
-    snprintf(cmd, sizeof cmd, "timeout 300 '%s/.local/bin/mjev' query --state '%s' --choice '%s' 2>/dev/null", home, state, choice);
+    snprintf(cmd, sizeof cmd, "timeout %d '%s/.local/bin/mjev' query --state '%s' --choice '%s' 2>/dev/null", deadline_s, home, state, choice);
     char *out = run_read(cmd, NULL);
     if (!out) return -1;
     char *p = strstr(out, "\"probabilities\"");
@@ -790,7 +792,14 @@ int main(int argc, char **argv) {
                 double left = md.length > 0 ? (double) (md.length - vlc_position()) / 60e6 : 4;
                 if (left < 0) left = 0;
                 double probs[NBANDS] = { 0 };
-                int from_jev = use_jev && ask_jev(left, probs) == 0;
+                /* Jev answers 25 s before the song ends at the latest (about
+                 * 40 s on the 35B with CLAUDE.md; longer while the machine
+                 * trains or the subject loads), at most 300 s; under 35 s
+                 * left it is not asked. A song is queued either way. */
+                int deadline = (int) (left * 60) - 25;
+                if (deadline > 300) deadline = 300;
+                int from_jev = use_jev && deadline >= 10 && ask_jev(left, deadline, probs) == 0;
+                if (use_jev && !from_jev) say("Jev %s: queued on the dot's band now", deadline >= 10 ? "did not answer in time" : "not asked (the song ends too soon)");
                 if (!from_jev) { for (int b = 0; b < NBANDS; b++) probs[b] = 0; probs[band] = 1; }
                 int nb = draw_band(probs);
                 const char *t = pick_track(nb);
