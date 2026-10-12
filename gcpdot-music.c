@@ -413,6 +413,26 @@ static long max_seen_id;
 /* Queues URI after the current item; returns its id (VLC's Tracks property
  * stays stale, so the new id is found by its URL among the ids after any
  * seen so far). */
+/* The last item of the playlist: VLC numbers items in the order they are
+ * added and everything is appended (the file manager's opens and this
+ * daemon's songs), so the highest id still present. MPRIS's NoTrack as the
+ * position means "first", not "last", which put songs at the top. */
+static int vlc_last_id(char *out, size_t n) {
+    long best = -1;
+    char id[96], url[4096];
+    for (long i = max_seen_id + 1, miss = 0; miss < 40; i++) {
+        snprintf(id, sizeof id, "/org/videolan/vlc/playlist/%ld", i);
+        if (track_url(id, url, sizeof url) == 0 && url[0]) { best = i; miss = 0; } else miss++;
+    }
+    if (best > max_seen_id) max_seen_id = best;
+    for (long i = max_seen_id; best < 0 && i > 0 && i > max_seen_id - 4000; i--) {
+        snprintf(id, sizeof id, "/org/videolan/vlc/playlist/%ld", i);
+        if (track_url(id, url, sizeof url) == 0 && url[0]) best = i;
+    }
+    if (best < 0) return -1;
+    snprintf(out, n, "/org/videolan/vlc/playlist/%ld", best);
+    return 0;
+}
 static int vlc_queue(const char *uri, const char *after, char *id_out, size_t n) {
     sd_bus_error e = SD_BUS_ERROR_NULL;
     int ok = sd_bus_call_method(bus, PLAYER, MPATH, "org.mpris.MediaPlayer2.TrackList", "AddTrack", &e, NULL, "sob", uri, after, 0);
@@ -601,8 +621,10 @@ int main(int argc, char **argv) {
                 if (t) {
                     char *u = uri_of(t);
                     char id[96];
-                    /* At the end of the playlist: after the last song queued. */
-                    if (vlc_queue(u, "/org/mpris/MediaPlayer2/TrackList/NoTrack", id, sizeof id) == 0) {
+                    /* At the bottom of the playlist: after its last item. */
+                    char last[96];
+                    if (vlc_last_id(last, sizeof last) != 0) snprintf(last, sizeof last, "%s", md.trackid);
+                    if (vlc_queue(u, last, id, sizeof id) == 0) {
                         snprintf(queued_id, sizeof queued_id, "%s", id);
                         snprintf(queued_uri, sizeof queued_uri, "%s", u);
                         queued_band = nb;
