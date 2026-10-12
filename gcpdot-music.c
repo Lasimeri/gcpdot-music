@@ -50,7 +50,7 @@ static const char *band_desc[NBANDS] = { "index below 0.05", "0.05 to 0.10", "0.
                                          "0.40 to 0.90", "0.90 to 0.95", "above 0.95" };
 
 #define MAXMIN (7 * 1440)          /* minutes of series kept */
-#define FETCH_S 300                /* the 24 h history fetched every 5 min */
+#define FETCH_S 1800               /* besides each song change, the 24 h history fetched every 30 min */
 #define LOOP_S 5
 #define UA "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 #define PLAYER "org.mpris.MediaPlayer2.vlc"
@@ -206,6 +206,7 @@ static int get_token(void) {
     char *js = run_read("curl -s -m 20 -A '" UA "' https://gcp2.net/js/data/api_token.js", NULL);
     if (!js) return -1;
     char *s = strstr(js, "Bearer ");
+    if (!s) say("token page without a token: %.120s", js);
     int ok = -1;
     if (s) {
         s += 7;
@@ -232,13 +233,20 @@ static void series_load(void) {
 /* New minutes from the 24 h history appended (memory and disk). */
 static int fetch(void) {
     if (!token[0] && get_token()) return -1;
-    for (int attempt = 0; attempt < 2; attempt++) {
+    for (int attempt = 0; attempt < 4; attempt++) {
         char cmd[1024];
         snprintf(cmd, sizeof cmd, "curl -s -m 30 -A '" UA "' -H 'Authorization: Bearer %s' -H 'Accept: application/json' "
                  "-H 'Referer: https://gcp2.net/data-results/live-data' https://gcp2.net/api/getNetVarAggregate24H", token);
         char *j = run_read(cmd, NULL);
         if (!j) return -1;
-        if (!strstr(j, "\"aggregates\"")) { free(j); if (attempt == 0 && get_token() == 0) continue; return -1; }
+        if (!strstr(j, "\"aggregates\"")) {
+            for (char *q = j; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';
+            say("history answer without data (attempt %d): %.200s", attempt + 1, j);
+            free(j);
+            if (attempt == 0) get_token();
+            if (attempt < 3) { sleep(3); continue; }
+            return -1;
+        }
         char p[700]; series_path(p, sizeof p);
         FILE *f = fopen(p, "a");
         int added = 0;
@@ -501,23 +509,45 @@ int main(int argc, char **argv) {
     time_t last_fetch = 0, last_ok = 0;
     char queued_id[96] = "", queued_uri[4600] = "", last_track[256] = "";
     int queued_band = -1, last_band = -1;
+    /* The song this daemon queued, kept on disk: after a restart it is taken
+     * over while VLC still holds it at that id, not queued a second time. */
+    char qp[700]; snprintf(qp, sizeof qp, "%s/queued", statedir);
+    {
+        FILE *q = fopen(qp, "r");
+        char line[4800];
+        if (q && fgets(line, sizeof line, q)) {
+            char *id = strtok(line, "\t\n"), *u = strtok(NULL, "\t\n"), *b = strtok(NULL, "\t\n");
+            char url[4600];
+            if (id && u && b && atoi(b) >= 0 && atoi(b) < NBANDS && track_url(id, url, sizeof url) == 0 && !strcmp(url, u)) {
+                snprintf(queued_id, sizeof queued_id, "%s", id);
+                snprintf(queued_uri, sizeof queued_uri, "%s", u);
+                queued_band = atoi(b);
+                if (id_num(id) > max_seen_id) max_seen_id = id_num(id);
+                say("taking over the queued %s (band %s)", id, band_name[queued_band]);
+            }
+        }
+        if (q) fclose(q);
+    }
     while (!stop) {
         time_t now = time(NULL);
-        if (now - last_fetch >= FETCH_S || !last_ok) {
+        struct meta md;
+        char st[32] = "";
+        int have = vlc_meta(&md) == 0 && vlc_status(st, sizeof st) == 0;
+        /* Fetched the moment a song ends (the next one is then chosen on the
+         * newest minute), at the start, while the feed has not answered (every
+         * 30 s), and every 30 min to keep the status line current. */
+        int song_changed = have && md.trackid[0] && strcmp(md.trackid, last_track) != 0;
+        if ((song_changed && now - last_fetch >= 10) || !last_fetch || (!last_ok && now - last_fetch >= 30) || now - last_fetch >= FETCH_S) {
             int a = fetch();
             last_fetch = now;
-            if (a >= 0) { last_ok = now; if (a) say("feed: %d new minutes, latest netvar %.4f", a, sval[sn - 1]); }
+            if (a >= 0) { last_ok = now; say("feed%s: %d new minutes, latest netvar %.4f, %ld s old", song_changed ? " (song change)" : "", a, sval[sn - 1], (long) (now - sep[sn - 1])); }
             else say("feed: no answer (keeping the series as it is)");
         }
         double dot = dot_now();
         int band = dot >= 0 ? band_of(dot) : 3;
         int stale = !last_ok || now - last_ok > 3 * FETCH_S;
-
-        struct meta md;
-        char st[32] = "";
-        int have = vlc_meta(&md) == 0 && vlc_status(st, sizeof st) == 0;
         if (!have) {
-            queued_id[0] = 0; last_track[0] = 0;
+            queued_id[0] = 0; last_track[0] = 0;   /* VLC gone: its ids start again */
         } else {
             long cur = id_num(md.trackid);
             if (cur > max_seen_id) max_seen_id = cur;
@@ -526,11 +556,12 @@ int main(int argc, char **argv) {
                 logline("S\t%ld\t%s\t%.4f\t%s\t%s\n", (long) now, queued_id, dot, band_name[band], band_name[queued_band]);
                 say("started (%s, dot now %.3f %s)", band_name[queued_band], dot, band_name[band]);
                 queued_id[0] = 0;
+                unlink(qp);   /* played: a restart must not take it over */
             }
             /* Gone from the playlist (replaced or removed): queued again. */
             if (queued_id[0]) {
                 char url[4600];
-                if (track_url(queued_id, url, sizeof url) == 0 && strcmp(url, queued_uri)) queued_id[0] = 0;
+                if (track_url(queued_id, url, sizeof url) == 0 && strcmp(url, queued_uri)) { queued_id[0] = 0; unlink(qp); }
             }
             /* "now": a band change cuts to the new band. */
             if (switch_now && !stale && last_band >= 0 && band != last_band && strcmp(st, "Playing") == 0) {
@@ -558,13 +589,17 @@ int main(int argc, char **argv) {
                 if (t) {
                     char *u = uri_of(t);
                     char id[96];
-                    if (vlc_queue(u, md.trackid, id, sizeof id) == 0) {
+                    /* At the end of the playlist: after the last song queued. */
+                    if (vlc_queue(u, "/org/mpris/MediaPlayer2/TrackList/NoTrack", id, sizeof id) == 0) {
                         snprintf(queued_id, sizeof queued_id, "%s", id);
                         snprintf(queued_uri, sizeof queued_uri, "%s", u);
                         queued_band = nb;
-                        logline("Q\t%ld\t%s\t%.1f\t%.4f\t%s\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%s\t%s\n", (long) now, id, left, dot,
-                                band_name[band], from_jev ? "jev" : "dot", probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], band_name[nb], t);
-                        say("queued after %s (in %.1f min): %s band %s [%s %.2f %.2f %.2f %.2f %.2f %.2f] %s", md.trackid, left,
+                        FILE *q = fopen(qp, "w");
+                        if (q) { fprintf(q, "%s\t%s\t%d\n", id, u, nb); fclose(q); }
+                        logline("Q\t%ld\t%s\t%.1f\t%.4f\t%s\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%s\t%s\t%ld\n", (long) now, id, left, dot,
+                                band_name[band], from_jev ? "jev" : "dot", probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], band_name[nb], t,
+                                sn ? (long) (now - sep[sn - 1]) : -1L);
+                        say("queued at the end (%s plays, %.1f min left): %s band %s [%s %.2f %.2f %.2f %.2f %.2f %.2f] %s", md.trackid, left,
                             from_jev ? "Jev" : "dot", band_name[nb], from_jev ? "Jev" : "dot", probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], t);
                     } else say("could not queue %s", t);
                     free(u);
