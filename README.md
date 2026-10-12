@@ -173,3 +173,21 @@ every new minute (the feed is read every 2 min) and alerts at P >= 0.6.
 The window's band-change log (last 24 h of the 2-minute alerts): **hits** are band changes an alert
 caught (P(change) >= 0.6, naming the right band), **misses** are changes without such an alert,
 **false alarms** are alerts whose change did not come; below them the latest five events, newest first.
+
+## Local source: the dot from this PC's RNG
+
+`source=local` in bands.conf rebuilds the dot from the reference egg (RDSEED, one 200-bit trial a second,
+z = (trial - 100)/sqrt(50)) instead of GCP 2.0's feed, which is 2.5 to 4 minutes late and rate limited
+("Too Many Attempts." on its one shared token). The egg's minutes are independent, so the dot is exact:
+the 1 h and 2 h windows' summed z^2 against chi-square with as many degrees of freedom as trials (the
+original dot's math, calibrated from the first hour), the one farther from 0.5. The forecast is exact
+too: the future minutes' summed z^2 is chi-square with 60 x h degrees of freedom, and 21 of its
+quantiles through the index give the band odds; with the actual future minutes (the oracle) it matches
+the live local dot 100% of the time. GCP is not read in this mode; its own prediction and alert files
+end in `-local`.
+
+What it costs, measured on 0.4 days of the egg (`gcpdot-music mech 2`/`5`): the egg's dot crosses band
+edges about four to five times as often as GCP 2.0's smoothed one (38 changes in 142 minutes), and its
+changes are decided by bits not yet drawn: 2 min ahead 83.8% right (persistence 73.2%), changes caught
+55.3%, alerts right 75.0%, log loss 0.367; 5 min 73.6% (65.7%). That is the limit for a truly random
+source, not a model short of data.

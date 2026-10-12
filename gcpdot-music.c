@@ -46,6 +46,7 @@
 #include <pthread.h>
 
 #define NBANDS 6
+#define NQ 21   /* quantiles through which a forecast's uncertainty is passed */
 static const char *band_name[NBANDS] = { "red", "orange", "yellow", "green", "teal", "blue" };
 static const char *band_desc[NBANDS] = { "index below 0.05", "0.05 to 0.10", "0.10 to 0.40",
                                          "0.40 to 0.90", "0.90 to 0.95", "above 0.95" };
@@ -69,6 +70,8 @@ static void say(const char *fmt, ...) {
 /* ---- configuration ---- */
 static char root[1024] = "/mnt/Personal_Media/Personal_Media/MusicMedia/(0)MainPL";
 static int switch_now = 0, use_jev = 1;
+static int src_local;              /* source=local: the dot from this PC's RNG (below) */
+static const char *sfx = "";       /* "-local": its own predictions and alerts files */
 static char band_dirs[NBANDS][2048];
 
 static const char *default_conf =
@@ -85,6 +88,10 @@ static const char *default_conf =
     "# on: Intel Phi Jev forecasts the band at the next song (mjev query);\n"
     "# off: the dot's band now\n"
     "jev=on\n"
+    "# gcp: the dot from GCP 2.0's live netvar (2.5 to 4 minutes late, rate\n"
+    "# limited); local: rebuilt from this PC's RNG (RDSEED, GCP 1.0's math,\n"
+    "# under a minute late)\n"
+    "source=gcp\n"
     "red=Deathstep,Hardstyle,Dubstep\n"
     "orange=Acid,Glitch\n"
     "yellow=Metal-Rock,Electro,EDM,Euro_Beat,Italio\n"
@@ -116,6 +123,7 @@ static void load_conf(void) {
         if (!strcmp(k, "root")) snprintf(root, sizeof root, "%s", v);
         else if (!strcmp(k, "switch")) switch_now = !strcmp(v, "now");
         else if (!strcmp(k, "jev")) use_jev = strcmp(v, "off") != 0;
+        else if (!strcmp(k, "source")) { src_local = !strcmp(v, "local"); sfx = src_local ? "-local" : ""; }
         else for (int b = 0; b < NBANDS; b++) if (!strcmp(k, band_name[b])) snprintf(band_dirs[b], sizeof band_dirs[b], "%s", v);
     }
     fclose(f);
@@ -267,6 +275,7 @@ static int get_token(void) {
     return ok;
 }
 static long sep[MAXMIN]; static double sval[MAXMIN]; static int sn;
+static int scount[MAXMIN];   /* local source: the trials in each minute (sval is their mean z^2) */
 static void series_path(char *p, size_t n) { snprintf(p, n, "%s/netvar.tsv", statedir); }
 static void series_load(void) {
     char p[700]; series_path(p, sizeof p);
@@ -358,7 +367,9 @@ static double index_w(int w, int b0, int end) {
     }
     return (double) ge / tot;
 }
+static double local_dot_at(int end);
 static double dot_at(int end, int b0) {
+    if (src_local) return local_dot_at(end);   /* the exact chi-square index */
     double a = index_w(60, b0, end), b = index_w(120, b0, end);
     if (a < 0) return b;
     if (b < 0) return a;
@@ -466,6 +477,103 @@ static double egg_dot_at(long end) {
 }
 static long egg_latest(void) { pthread_mutex_lock(&emu); long m = esn ? emin[esn - 1] : 0; pthread_mutex_unlock(&emu); return m; }
 
+/* ---- the local source: the dot rebuilt from this PC's RNG ----
+ * With source=local the series the dot, the forecasts and the scoring run
+ * on is the reference egg's: one value a minute, the mean z^2 of its
+ * trials that minute (GCP 1.0's per-second netvar for a one-egg network,
+ * averaged), appended as each minute closes (under a minute late, against
+ * GCP 2.0's 2.5 to 4 minutes and its rate limit). GCP is not read then. A
+ * minute with fewer than 30 trials (a restart) is left out. */
+static int local_sync(void) {
+    int added = 0;
+    pthread_mutex_lock(&emu);
+    for (int i = 0; i < esn; i++) {
+        if (en[i] < 30 || (sn && emin[i] <= sep[sn - 1])) continue;
+        if (sn == MAXMIN) { memmove(sep, sep + 1, (MAXMIN - 1) * sizeof *sep); memmove(sval, sval + 1, (MAXMIN - 1) * sizeof *sval); memmove(scount, scount + 1, (MAXMIN - 1) * sizeof *scount); sn--; }
+        sep[sn] = emin[i]; sval[sn] = ez2[i] / en[i]; scount[sn] = en[i]; sn++; added++;
+    }
+    pthread_mutex_unlock(&emu);
+    return added;
+}
+/* The series for the source in use: GCP 2.0's minutes kept on disk, or the
+ * egg's (its minutes kept on disk, egg-min.tsv). */
+static void series_open(void) {
+    if (src_local) { egg_load(); local_sync(); }
+    else series_load();
+}
+
+/* The local dot, exact: the egg's minutes are independent, so a window's
+ * summed z^2 over k trials is chi-square with k degrees of freedom and the
+ * index is its upper-tail probability (the original dot's math), calibrated
+ * from the first hour with no baseline; the 1 h and 2 h windows, the one
+ * farther from 0.5. Windows are by time: the minutes ending in (E - w, E]. */
+static void local_known(long e, int w, int upto, double *s2, long *k) {
+    *s2 = 0; *k = 0;
+    for (int i = upto - 1; i >= 0 && sep[i] > e - (long) w * 60; i--)
+        if (sep[i] <= e) { *s2 += sval[i] * scount[i]; *k += scount[i]; }
+}
+static double farther(double a, double b) {
+    if (a < 0) return b;
+    if (b < 0) return a;
+    return fabs(b - 0.5) > fabs(a - 0.5) ? b : a;
+}
+static double local_dot_at(int end) {
+    if (end < 1 || end > sn) return -1;
+    long e = sep[end - 1];
+    double s2a, s2b; long ka, kb;
+    local_known(e, 60, end, &s2a, &ka); local_known(e, 120, end, &s2b, &kb);
+    double a = ka >= 0.8 * 3600 ? chi2_upper(s2a, (double) ka) : -1;
+    double b = kb >= 0.8 * 7200 ? chi2_upper(s2b, (double) kb) : -1;
+    return farther(a, b);
+}
+/* The standard normal quantile (Acklam's rational approximation, relative
+ * error under 1.2e-9), and the chi-square quantile by Wilson-Hilferty. */
+static double norm_q(double p) {
+    static const double a[] = { -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00 };
+    static const double b[] = { -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01 };
+    static const double c[] = { -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00 };
+    static const double d[] = { 7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00 };
+    double q, r;
+    if (p < 0.02425) { q = sqrt(-2 * log(p)); return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1); }
+    if (p > 1 - 0.02425) { q = sqrt(-2 * log(1 - p)); return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1); }
+    q = p - 0.5; r = q * q;
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+}
+static double chi2_q(double k, double p) {
+    double h = 2.0 / (9.0 * k), v = 1 - h + norm_q(p) * sqrt(h);
+    return k * v * v * v;
+}
+/* The exact forecast of the local dot H minutes after minute T: the known
+ * minutes of each window plus the future ones' summed z^2, which is
+ * chi-square with 60 H degrees of freedom; NQ quantiles of it through the
+ * index give the band probabilities. Nothing to fit. Method 3 (the oracle
+ * check) puts the actual future minutes in instead. */
+static double local_forecast(int method, int t, int h, double p[NBANDS]) {
+    long e = sep[t] + (long) h * 60;
+    for (int b = 0; b < NBANDS; b++) p[b] = 0;
+    if (method == 3) {
+        int end = t + 1; while (end < sn && sep[end] <= e) end++;
+        double d = end - 1 > t && sep[end - 1] == e ? local_dot_at(end) : -1;
+        if (d >= 0) p[band_of(d)] = 1;
+        return d;
+    }
+    double s2a, s2b, kf = 60.0 * h; long ka, kb;
+    local_known(e, 60, t + 1, &s2a, &ka); local_known(e, 120, t + 1, &s2b, &kb);
+    double point = -1;
+    for (int q = 0; q < NQ; q++) {
+        double x = chi2_q(kf, (q + 0.5) / NQ);
+        double a = ka + kf >= 0.8 * 3600 ? chi2_upper(s2a + x, ka + kf) : -1;
+        double b = kb + kf >= 0.8 * 7200 ? chi2_upper(s2b + x, kb + kf) : -1;
+        double d = farther(a, b);
+        if (d < 0) return -1;
+        p[band_of(d)] += 1.0 / NQ;
+        if (q == NQ / 2) point = d;
+    }
+    double tot = 0; for (int b = 0; b < NBANDS; b++) { p[b] = p[b] * 0.98 + 0.02 / NBANDS; tot += p[b]; }
+    for (int b = 0; b < NBANDS; b++) p[b] /= tot;
+    return point;
+}
+
 /* ---- forecasting the dot from its own history ----
  * The dot is a one- and two-hour window moving a minute at a time, so where
  * it will be a few minutes on shows in where it is and where it is heading.
@@ -542,7 +650,7 @@ static double blend_a = 0.5, blend_c = 1.0;   /* p ∝ Jev^a * analog^c until re
 static int band_idx(const char *s) { for (int b = 0; b < NBANDS; b++) if (!strcmp(s, band_name[b])) return b; return -1; }
 static void load_resolved(void) {
     rn = 0;
-    char p[700]; snprintf(p, sizeof p, "%s/predictions.tsv", statedir);
+    char p[700]; snprintf(p, sizeof p, "%s/predictions%s.tsv", statedir, sfx);
     FILE *f = fopen(p, "r");
     if (!f) return;
     struct res pend[64]; char pid[64][96]; int pn = 0;
@@ -655,10 +763,11 @@ static void shq(const char *s, char *out, size_t n) {
 static int ask_jev(double horizon_min, int deadline_s, const double *suggest, double probs[NBANDS]) {
     if (sn < 120) return -1;
     char state[8192]; int o = 0;
-    o += snprintf(state + o, sizeof state - o, "GCP 2.0 global network variance (netvar), the mean of each 10 minutes over the last two hours, oldest first:");
+    if (src_local) o += snprintf(state + o, sizeof state - o, "This PC's hardware random generator (RDSEED, one 200-bit trial a second, scored as z = (sum - 100) / sqrt(50)), its network variance (mean z squared per minute, expected 1), the mean of each 10 minutes over the last two hours, oldest first:");
+    else o += snprintf(state + o, sizeof state - o, "GCP 2.0 global network variance (netvar), the mean of each 10 minutes over the last two hours, oldest first:");
     for (int k = 0; k < 12; k++) {
         double s = 0; for (int i = sn - 120 + k * 10; i < sn - 120 + (k + 1) * 10; i++) s += sval[i];
-        o += snprintf(state + o, sizeof state - o, "%s %.1f", k ? "," : "", s / 10);
+        o += snprintf(state + o, sizeof state - o, src_local ? "%s %.3f" : "%s %.1f", k ? "," : "", s / 10);
     }
     o += snprintf(state + o, sizeof state - o, ". The gcpdot index (the share of past windows with a mean network variance at least as high; low = unusually high variance) every 10 minutes over the same two hours:");
     for (int k = 0; k < 12; k++) {
@@ -669,7 +778,7 @@ static int ask_jev(double horizon_min, int deadline_s, const double *suggest, do
     /* The reference: this machine's hardware RNG through the same math, at
      * the same minutes (independent of the network: chance agreement). */
     double rnow = egg_dot_at(sep[sn - 1]);
-    if (rnow >= 0) {
+    if (rnow >= 0 && !src_local) {   /* local: the series is the egg, no separate reference */
         o += snprintf(state + o, sizeof state - o, " Reference (this machine's own hardware random generator, one 200-bit trial a second, the same index with an exact chi-square; independent of the network) every 10 minutes over the same two hours:");
         for (int k = 0; k < 12; k++) {
             double x = egg_dot_at(sep[sn - 111 + k * 10]);
@@ -859,13 +968,14 @@ static void paths(void) {
 }
 
 static int cmd_dot(void) {
-    series_load();
-    int f = fetch();
+    series_open();
+    int f = src_local ? 0 : fetch();
     if (f < 0) say("the feed did not answer; the minutes kept on disk only");
     if (sn < 240) { say("only %d minutes of the series", sn); return 1; }
     double x = dot_now();
     printf("minutes kept: %d (%.1f days), latest netvar %.4f at %ld\n", sn, sn / 1440.0, sval[sn - 1], sep[sn - 1]);
-    printf("1 h index %.3f, 2 h index %.3f -> dot %.3f: %s\n", index_w(60, 0, sn), index_w(120, 0, sn), x, band_name[band_of(x)]);
+    if (src_local) printf("source local (this PC's RNG): exact chi-square dot %.3f: %s\n", x, band_name[band_of(x)]);
+    else printf("1 h index %.3f, 2 h index %.3f -> dot %.3f: %s\n", index_w(60, 0, sn), index_w(120, 0, sn), x, band_name[band_of(x)]);
     /* The last 24 h, each minute's dot against the same baseline. */
     int cnt[NBANDS] = { 0 }, tot = 0;
     for (int end = sn - 1440 > 240 ? sn - 1440 : 240; end <= sn; end++) { double d = dot_at(end, 0); if (d >= 0) { cnt[band_of(d)]++; tot++; } }
@@ -963,7 +1073,7 @@ struct cev { long target; int nb, act, call, ob; double pc; };
 static struct cev cev[NCEV]; static int ncev;
 static int minute_index(long e);
 static void alert_log(long made, long target, int now_b, const double p[NBANDS]) {
-    char p2[700]; snprintf(p2, sizeof p2, "%s/alerts.tsv", statedir);
+    char p2[700]; snprintf(p2, sizeof p2, "%s/alerts%s.tsv", statedir, sfx);
     FILE *f = fopen(p2, "a");
     if (!f) return;
     fprintf(f, "%ld\t%ld\t%d", made, target, now_b);
@@ -972,7 +1082,7 @@ static void alert_log(long made, long target, int now_b, const double p[NBANDS])
     fclose(f);
 }
 static void alert_score(void) {
-    char p2[700]; snprintf(p2, sizeof p2, "%s/alerts.tsv", statedir);
+    char p2[700]; snprintf(p2, sizeof p2, "%s/alerts%s.tsv", statedir, sfx);
     memset(&live24, 0, sizeof live24); ncev = 0;
     FILE *f = fopen(p2, "r");
     if (!f || !sn) { if (f) fclose(f); return; }
@@ -1003,6 +1113,7 @@ static void write_dots(double gcp, double ref, const double pf[NBANDS], int have
     FILE *f = fopen(t, "w");
     if (!f) return;
     fprintf(f, "time=%ld\ngcp=%.4f\nlatest_minute=%ld\nref=%.4f\n", (long) time(NULL), gcp, sn ? sep[sn - 1] : 0L, ref);
+    fprintf(f, "source=%s\n", src_local ? "local" : "gcp");
     if (have_pred) {
         fprintf(f, "pred_at=%ld\npred_src=%s\npred=", pred_at, pred_src_jev ? "Jev + rebuilt dot" : "rebuilt dot");
         for (int b = 0; b < NBANDS; b++) fprintf(f, "%s%.4f", b ? " " : "", pf[b]);
@@ -1046,6 +1157,7 @@ static int cmd_show(void) {
     while (!stop) {
         double gcp = -1, ref = -1, pred[NBANDS] = { 0 }; long t = 0, latest = 0, pred_at = 0; int havep = 0;
         char src[32] = "", lastp[16] = "", lasta[16] = ""; long last_tgt = 0, alert_at2 = 0; double al[NBANDS] = { 0 }; int haveal = 0;
+        char srcmode[16] = "gcp";
         int ln = 0, lok = 0, lch = 0, lcaught = 0, lcalls = 0, lcallok = 0; double lll = 0;
         struct cev ev[NCEV]; int nev = 0;
         FILE *f = fopen(p, "r");
@@ -1057,6 +1169,7 @@ static int cmd_show(void) {
                 if (sscanf(line, "pred_src=%31[^\n]", src) == 1) continue;
                 if (sscanf(line, "last_target=%ld", &last_tgt) == 1 || sscanf(line, "last_pred=%15s", lastp) == 1 || sscanf(line, "last_actual=%15s", lasta) == 1) continue;
                 if (sscanf(line, "alert_at=%ld", &alert_at2) == 1) continue;
+                if (sscanf(line, "source=%15s", srcmode) == 1) continue;
                 if (sscanf(line, "live=%d %d %d %d %d %d %lf", &ln, &lok, &lch, &lcaught, &lcalls, &lcallok, &lll) == 7) continue;
                 if (nev < NCEV && sscanf(line, "event=%ld %d %d %d %d %lf", &ev[nev].target, &ev[nev].nb, &ev[nev].act, &ev[nev].call, &ev[nev].ob, &ev[nev].pc) == 6) { if (ev[nev].nb >= 0 && ev[nev].nb < NBANDS && ev[nev].act >= 0 && ev[nev].act < NBANDS && ev[nev].ob >= 0 && ev[nev].ob < NBANDS) nev++; continue; }
                 if (!strncmp(line, "alert=", 6)) { haveal = sscanf(line + 6, "%lf %lf %lf %lf %lf %lf", &al[0], &al[1], &al[2], &al[3], &al[4], &al[5]) == 6; continue; }
@@ -1065,7 +1178,8 @@ static int cmd_show(void) {
             fclose(f);
         }
         long now = time(NULL);
-        printf("\033[48;2;10;10;15m\033[2J\033[H\033[38;2;196;148;90m GCP 2.0 live dot and its forecast\033[0m");
+        int local = !strcmp(srcmode, "local");
+        printf("\033[48;2;10;10;15m\033[2J\033[H\033[38;2;196;148;90m %s\033[0m", local ? "this PC's RNG dot and its forecast" : "GCP 2.0 live dot and its forecast");
         /* Stale: busy on a long wait (the busy note says which), or, five
          * minutes on without a note, not writing at all. */
         if (!f || now - t > 30) {
@@ -1076,6 +1190,8 @@ static int cmd_show(void) {
             else if (!f || now - t > 300) printf("\033[s\033[2;3H\033[38;2;255;80;80mdaemon not writing: systemctl --user status gcpdot-music\033[u\033[0m");
         }
         /* the two dots */
+        /* no song forecast yet (a fresh source): the 2-minute alert forecast */
+        if (!havep && haveal) { for (int b = 0; b < NBANDS; b++) pred[b] = al[b]; pred_at = alert_at2; havep = 1; snprintf(src, sizeof src, "2-minute forecast"); }
         int pb = havep ? top_of(pred) : -1;
         draw_disc(3, 3, 12, gcp >= 0 ? colour_of(gcp) : 0x333333, bg);
         draw_disc(3, 27, 12, pb >= 0 ? colour_of(band_mid[pb]) : 0x333333, bg);
@@ -1115,7 +1231,7 @@ static int cmd_show(void) {
             }
             printf("\033[19;3H\033[38;2;138;106;62m%s", src);
         }
-        printf("\033[20;3H\033[38;2;150;150;150mthis PC (reference) ");
+        printf("\033[20;3H\033[38;2;150;150;150m%s", local ? "exact chi-square check " : "this PC (reference) ");
         if (ref >= 0) { unsigned c = colour_of(ref); printf("\033[38;2;%u;%u;%um●\033[38;2;150;150;150m %.3f %s", c >> 16, (c >> 8) & 255, c & 255, ref, band_name[band_of(ref)]); }
         else printf("warming up");
         char ltm[8] = "-"; if (last_tgt) { time_t tt2 = last_tgt; strftime(ltm, sizeof ltm, "%H:%M", localtime(&tt2)); }
@@ -1151,7 +1267,7 @@ static int cmd_show(void) {
 }
 
 static int cmd_score(void) {
-    series_load(); dots_sync(); load_resolved();
+    series_open(); dots_sync(); load_resolved();
     if (!rn) { printf("no resolved forecasts yet (%s/predictions.tsv)\n", statedir); return 1; }
     struct { const char *name; int n, ok, xn, xok; double ll; } m[4] = { { "persistence" }, { "Jev" }, { "analog" }, { "blend" } };
     for (int i = 0; i < rn; i++) {
@@ -1308,11 +1424,12 @@ static double mech_dot(int t, int h, double futsum_extra, const double *fut) {
     if (b < 0) return a;
     return fabs(b - 0.5) > fabs(a - 0.5) ? b : a;
 }
-#define NQ 21
 /* Band probabilities for H minutes after minute T: the point forecast's
  * dot shifted by NQ quantiles of the forecaster's past H-step summed errors
  * (pairs whose outcome was known by T). Returns the point forecast's dot. */
+static double local_forecast(int method, int t, int h, double p[NBANDS]);
 static double mech_forecast(int method, int t, int h, double p[NBANDS]) {
+    if (src_local) return local_forecast(method, t, h, p);   /* exact: future minutes chi-square */
     double fut[64], e[1200]; int ne = 0;
     if (h > 64) h = 64;
     for (int b = 0; b < NBANDS; b++) p[b] = 0;
@@ -1352,7 +1469,7 @@ static double mech_forecast(int method, int t, int h, double p[NBANDS]) {
  * point band right overall, on the band changes (recall) and among the
  * changes it called (precision), and the probabilities' log loss. */
 static int cmd_mech(int h, int only) {
-    series_load(); dots_sync(); psum_sync();
+    series_open(); dots_sync(); psum_sync();
     for (int m = 0; m < 8; m++) {
         if (only >= 0 && m != only) continue;
         int n = 0, ok = 0, pok = 0, ch = 0, chok = 0, called = 0, calledok = 0; double ll = 0;
@@ -1392,7 +1509,7 @@ static int cmd_mech(int h, int only) {
 }
 
 static int cmd_backtest(int h) {
-    series_load();
+    series_open();
     dots_sync();
     int n = 0, pok = 0, aok = 0, cok = 0, xn = 0, xa = 0, xp = 0; double all = 0, cll = 0, pll = 0;
     for (int t = 360; t + h < gdn; t++) {
@@ -1421,6 +1538,7 @@ static int cmd_backtest(int h) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     paths();
+    load_conf();   /* the source (gcp or local) decides the series for every command */
     if (argc > 1 && !strcmp(argv[1], "score")) return cmd_score();
     if (argc > 1 && !strcmp(argv[1], "mech")) return cmd_mech(argc > 2 ? atoi(argv[2]) : 2, argc > 3 ? atoi(argv[3]) : -1);
     if (argc > 1 && !strcmp(argv[1], "show")) return cmd_show();
@@ -1438,8 +1556,8 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     load_conf();
     scan_tracks();
-    series_load();
-    egg_load();
+    series_open();   /* local: the egg's minutes (egg_load inside) */
+    if (!src_local) egg_load();
     dots_sync();
     load_resolved();
     refit();
@@ -1450,7 +1568,7 @@ int main(int argc, char **argv) {
     int64_t prev_len = 0, prev_pos = 0, prev_obs = 0; int prev_playing = 0;
     double last_pf[NBANDS] = { 0 }; long last_pred_at = 0; int last_pred = 0, last_pred_jev = 0;   /* for the display */
     {   /* the last forecast logged, so the display has one at once after a restart */
-        char lpp[700]; snprintf(lpp, sizeof lpp, "%s/predictions.tsv", statedir);
+        char lpp[700]; snprintf(lpp, sizeof lpp, "%s/predictions%s.tsv", statedir, sfx);
         FILE *q = fopen(lpp, "r");
         char line[8192];
         while (q && fgets(line, sizeof line, q)) {
@@ -1473,7 +1591,7 @@ int main(int argc, char **argv) {
         FILE *c = fopen(cp, "r");
         if (c) { long e; char rest[256]; while (fscanf(c, "%ld%255[^\n]", &e, rest) == 2) last_cmp = e; fclose(c); }
     }
-    char lp[700]; snprintf(lp, sizeof lp, "%s/predictions.tsv", statedir);
+    char lp[700]; snprintf(lp, sizeof lp, "%s/predictions%s.tsv", statedir, sfx);
     predlog = fopen(lp, "a");
     if (sd_bus_open_user(&bus) < 0) { say("no session bus"); return 1; }
     say("switch %s, Jev %s; %d minutes of the series kept", switch_now ? "now" : "at the next song", use_jev ? "on" : "off", sn);
@@ -1509,10 +1627,17 @@ int main(int argc, char **argv) {
          * newest minute), at the start, while the feed has not answered (every
          * 30 s), and every 30 min to keep the status line current. */
         int song_changed = have && md.trackid[0] && strcmp(md.trackid, last_track) != 0;
-        if ((song_changed && now - last_fetch >= 10) || !last_fetch || (!last_ok && now - last_fetch >= 30) || now - last_fetch >= FETCH_S) {
-            int a = fetch();
+        /* local: the egg's closed minutes, every pass (no network); gcp: the
+         * feed on each song change, every FETCH_S, and every 30 s while it
+         * has not answered */
+        int due = src_local || (song_changed && now - last_fetch >= 10) || !last_fetch || (!last_ok && now - last_fetch >= 30) || now - last_fetch >= FETCH_S;
+        if (due) {
+            int a = src_local ? local_sync() : fetch();
             last_fetch = now;
-            if (a >= 0) { last_ok = now; say("feed%s: %d new minutes, latest netvar %.4f, %ld s old", song_changed ? " (song change)" : "", a, sval[sn - 1], (long) (now - sep[sn - 1])); }
+            if (a >= 0) {
+                last_ok = now;
+                if (!src_local) say("feed%s: %d new minutes, latest netvar %.4f, %ld s old", song_changed ? " (song change)" : "", a, sval[sn - 1], (long) (now - sep[sn - 1]));
+            } else say("feed: no answer (keeping the series as it is)");
             /* New minutes resolve the forecasts made for them: scored, and
              * the blend refitted. */
             if (a > 0) { dots_sync(); int before = rn; load_resolved(); if (rn != before) refit(); }
@@ -1524,14 +1649,13 @@ int main(int argc, char **argv) {
                 }
                 alert_score();
             }
-            else say("feed: no answer (keeping the series as it is)");
         }
         double dot = dot_now();
         int band = dot >= 0 ? band_of(dot) : 3;
         int stale = !last_ok || now - last_ok > 3 * FETCH_S;
         /* Each GCP minute not yet compared, against the reference egg's dot
          * at that minute (minutes before the egg had an hour are skipped). */
-        {
+        if (!src_local) {   /* local: the series is the egg itself, nothing to compare */
             int i0 = sn;
             while (i0 > 0 && sep[i0 - 1] > last_cmp) i0--;
             FILE *c = i0 < sn ? fopen(cp, "a") : NULL;
