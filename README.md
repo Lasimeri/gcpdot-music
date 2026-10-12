@@ -142,3 +142,26 @@ script. It shows the live GCP 2.0 dot and its forecast for the next song (the sa
 gcpdot's colours, the forecast per band,
 your PC's reference egg (a local control, not GCP data) and whether the last forecast hit; it reads `~/.local/state/gcpdot-music/dots`,
 which the daemon rewrites every loop, every 2 s.
+
+## The mechanistic forecast (in use)
+
+The dot is a function of the netvar series, so it is rebuilt rather than guessed: h minutes on, each 1 h
+and 2 h window has dropped its h oldest minutes (known) and gained h new ones (forecast by AR(2) on the
+minute-to-minute changes); the future windows, the h windows in between and the target are ranked
+exactly as the live dot ranks them. The forecaster's past h-step errors, replayed through the same
+ranking at 21 quantiles, give the band probabilities. Fed the actual future minutes (the oracle check),
+it reproduces the live dot 100% of the time, so all remaining error is the netvar forecast's.
+
+Backtest (`gcpdot-music mech H`, about 1.3 days, every other minute):
+
+| Ahead | Right (persistence) | Band changes caught | Changes called, right | Log loss |
+|---|---|---|---|---|
+| 2 min | 97.8% (94.5%) | 38 / 43 (88.4%) | 38 / 50 (76.0%) | 0.062 |
+| 5 min | 95.7% (86.8%) | 90 / 104 (86.5%) | 90 / 112 (80.4%) | 0.108 |
+
+A change can be called at a probability threshold: at 5 min, P >= 0.3 catches 91.3% (78.5% of calls
+right), 0.6 balances at about 84 / 83%, 0.8 makes 91.9% of calls right (76.0% caught). 90% on both at
+once is not reached on this data: when the dot sits on a band edge the next minutes' fresh randomness
+decides it. GCP publishes each minute 2.5 to 4 minutes late, so 5 minutes past the newest minute is
+about 1 to 2.5 minutes ahead of the clock. The display's alert line uses a 2-minute forecast made on
+every new minute (the feed is read every 2 min) and alerts at P >= 0.6.

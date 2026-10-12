@@ -51,7 +51,7 @@ static const char *band_desc[NBANDS] = { "index below 0.05", "0.05 to 0.10", "0.
                                          "0.40 to 0.90", "0.90 to 0.95", "above 0.95" };
 
 #define MAXMIN (7 * 1440)          /* minutes of series kept */
-#define FETCH_S 1800               /* besides each song change, the 24 h history fetched every 30 min */
+#define FETCH_S 120                /* besides each song change, the 24 h history fetched every 2 min (the change alert needs fresh minutes; gcp2.net's own gauge polls every 60 s) */
 #define LOOP_S 5
 #define UA "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 #define PLAYER "org.mpris.MediaPlayer2.vlc"
@@ -935,14 +935,22 @@ static unsigned colour_of(double x) {
 /* A band's colour: the colour at the middle of its index range. */
 static const double band_mid[NBANDS] = { 0.03, 0.07, 0.25, 0.65, 0.925, 0.97 };
 
+/* The change alert: the mechanistic forecast 2 minutes past the newest
+ * minute, made whenever new minutes arrive (not only per song). */
+static double alert_p[NBANDS]; static long alert_at; static int alert_ok;
 static void write_dots(double gcp, double ref, const double pf[NBANDS], int have_pred, long pred_at, int pred_src_jev) {
     char p[700], t[720]; snprintf(p, sizeof p, "%s/dots", statedir); snprintf(t, sizeof t, "%s.new", p);
     FILE *f = fopen(t, "w");
     if (!f) return;
     fprintf(f, "time=%ld\ngcp=%.4f\nlatest_minute=%ld\nref=%.4f\n", (long) time(NULL), gcp, sn ? sep[sn - 1] : 0L, ref);
     if (have_pred) {
-        fprintf(f, "pred_at=%ld\npred_src=%s\npred=", pred_at, pred_src_jev ? "Jev + analog" : "analog");
+        fprintf(f, "pred_at=%ld\npred_src=%s\npred=", pred_at, pred_src_jev ? "Jev + rebuilt dot" : "rebuilt dot");
         for (int b = 0; b < NBANDS; b++) fprintf(f, "%s%.4f", b ? " " : "", pf[b]);
+        fprintf(f, "\n");
+    }
+    if (alert_ok) {
+        fprintf(f, "alert_at=%ld\nalert=", alert_at);
+        for (int b = 0; b < NBANDS; b++) fprintf(f, "%s%.4f", b ? " " : "", alert_p[b]);
         fprintf(f, "\n");
     }
     if (rn) {
@@ -975,7 +983,7 @@ static int cmd_show(void) {
     const unsigned bg = 0x0A0A0F;
     while (!stop) {
         double gcp = -1, ref = -1, pred[NBANDS] = { 0 }; long t = 0, latest = 0, pred_at = 0; int havep = 0;
-        char src[32] = "", lastp[16] = "", lasta[16] = ""; long last_tgt = 0;
+        char src[32] = "", lastp[16] = "", lasta[16] = ""; long last_tgt = 0, alert_at2 = 0; double al[NBANDS] = { 0 }; int haveal = 0;
         FILE *f = fopen(p, "r");
         if (f) {
             char line[256];
@@ -984,6 +992,8 @@ static int cmd_show(void) {
                     sscanf(line, "ref=%lf", &ref) == 1 || sscanf(line, "pred_at=%ld", &pred_at) == 1) continue;
                 if (sscanf(line, "pred_src=%31[^\n]", src) == 1) continue;
                 if (sscanf(line, "last_target=%ld", &last_tgt) == 1 || sscanf(line, "last_pred=%15s", lastp) == 1 || sscanf(line, "last_actual=%15s", lasta) == 1) continue;
+                if (sscanf(line, "alert_at=%ld", &alert_at2) == 1) continue;
+                if (!strncmp(line, "alert=", 6)) { haveal = sscanf(line + 6, "%lf %lf %lf %lf %lf %lf", &al[0], &al[1], &al[2], &al[3], &al[4], &al[5]) == 6; continue; }
                 if (!strncmp(line, "pred=", 5)) havep = sscanf(line + 5, "%lf %lf %lf %lf %lf %lf", &pred[0], &pred[1], &pred[2], &pred[3], &pred[4], &pred[5]) == 6;
             }
             fclose(f);
@@ -1014,6 +1024,22 @@ static int cmd_show(void) {
             /* the GCP minute it is for (it resolves when that minute arrives) */
             time_t tt = pred_at; char hm[8]; strftime(hm, sizeof hm, "%H:%M", localtime(&tt));
             printf("\033[11;20Hfor %s", hm);
+            /* The change alert: a band other than the live one at 0.6 or
+             * more by that minute (the balanced point of the backtest: at
+             * 2 min, 84% of changes caught, 84% of alerts right). */
+            if (gcp >= 0) {
+                /* the 2-minute alert forecast (made on every new minute) when
+                 * there is one, else the song's forecast */
+                const double *pp = haveal ? al : pred;
+                char am[8] = ""; time_t at = haveal ? alert_at2 : pred_at; strftime(am, sizeof am, "%H:%M", localtime(&at));
+                int nb = band_of(gcp), ob = -1;
+                for (int b = 0; b < NBANDS; b++) if (b != nb && (ob < 0 || pp[b] > pp[ob])) ob = b;
+                double pc = 1 - pp[nb];
+                if (pc >= 0.6) {
+                    unsigned c = colour_of(band_mid[ob]);
+                    printf("\033[12;3H\033[38;2;%u;%u;%um▲ change %s -> %s %.0f%% by %s", c >> 16, (c >> 8) & 255, c & 255, band_name[nb], band_name[ob], 100 * pc, am);
+                } else printf("\033[12;3H\033[38;2;100;100;100mno change by %s (%.0f%% chance)", am, 100 * pc);
+            }
             /* the forecast per band */
             for (int b = 0; b < NBANDS; b++) {
                 unsigned c = colour_of(band_mid[b]); int w = (int) (pred[b] * 20 + 0.5);
@@ -1082,6 +1108,148 @@ static int cmd_score(void) {
 
 /* The analog model on the stored series: at every minute, the forecast for
  * H minutes on from the minutes before it only, against persistence. */
+/* ---- the mechanistic forecast ----
+ * The dot is a function of the netvar series: the rank of the 1 h and 2 h
+ * window means. H minutes on, each window has dropped its H oldest minutes
+ * (known) and gained H new ones (forecast), so the future window sums are
+ * rebuilt from the known minutes plus a netvar forecast and ranked exactly
+ * as the live dot is; the netvar forecaster's past H-step errors, replayed
+ * through the same ranking, give the band probabilities. */
+static double *psum; static int psn;   /* prefix sums of sval: psum[i] = sum of the first i minutes */
+static void psum_sync(void) {
+    if (psn == sn + 1) return;
+    psum = realloc(psum, (sn + 1) * sizeof *psum);
+    psum[0] = 0; for (int i = 0; i < sn; i++) psum[i + 1] = psum[i] + sval[i];
+    psn = sn + 1;
+}
+/* The share of W-minute windows ending before minute END (exclusive) whose
+ * sum is at least CUR: the live dot's ranking, with the window given. */
+static double rank_sum(int w, int end, double cur) {
+    int tot = 0, ge = 0;
+    for (int i = 0; i + w <= end; i++) { tot++; if (psum[i + w] - psum[i] >= cur - 1e-9) ge++; }
+    return tot ? (double) ge / tot : -1;
+}
+/* Netvar forecasts for the H minutes after minute T (index, inclusive):
+ * 0 last value held, 1 the 5-minute trend carried on, 2 AR(2) on the
+ * minute-to-minute changes fitted on the minutes up to T. */
+static void nv_forecast(int method, int t, int h, double *out) {
+    if (method == 3) { for (int k = 0; k < h; k++) out[k] = t + 1 + k < sn ? sval[t + 1 + k] : sval[sn - 1]; return; }   /* the oracle: the actual minutes (backtest check only) */
+    if (method == 0 || t < 6) { for (int k = 0; k < h; k++) out[k] = sval[t]; return; }
+    if (method == 1) { double s = (sval[t] - sval[t - 5]) / 5; for (int k = 0; k < h; k++) out[k] = sval[t] + (k + 1) * s; return; }
+    /* AR(2) on d_i = x_i - x_(i-1): least squares over the last 600 changes */
+    double s11 = 0, s12 = 0, s22 = 0, b1 = 0, b2 = 0;
+    for (int i = (t > 603 ? t - 600 : 3); i <= t; i++) {
+        double d = sval[i] - sval[i - 1], d1 = sval[i - 1] - sval[i - 2], d2 = sval[i - 2] - sval[i - 3];
+        s11 += d1 * d1; s12 += d1 * d2; s22 += d2 * d2; b1 += d * d1; b2 += d * d2;
+    }
+    double det = s11 * s22 - s12 * s12, a1 = 0, a2 = 0;
+    if (fabs(det) > 1e-12) { a1 = (b1 * s22 - b2 * s12) / det; a2 = (b2 * s11 - b1 * s12) / det; }
+    double x = sval[t], d1 = sval[t] - sval[t - 1], d2 = sval[t - 1] - sval[t - 2];
+    for (int k = 0; k < h; k++) { double d = a1 * d1 + a2 * d2; x += d; out[k] = x; d2 = d1; d1 = d; }
+}
+/* The dot H minutes after minute T, from the known minutes and FUT (the
+ * forecast of the next H minutes, summed into each window), ranked against
+ * the windows complete by minute T. */
+/* The sum of the W-minute window ending at minute E (which may lie up to H
+ * minutes past T): known minutes plus forecast ones, the summed error
+ * EXTRA spread over the forecast minutes in step (k of H gets k/H of it). */
+static double win_sum(int w, int t, int h, int e, double extra, const double *fut) {
+    int from = e - w + 1;
+    double s = 0;
+    if (from <= t) s += psum[(e < t ? e : t) + 1] - psum[from];
+    for (int k = 0; k < h; k++) { int m = t + 1 + k; if (m >= from && m <= e) s += fut[k]; }
+    if (e > t) s += extra * (double) (e - t) / h;
+    return s;
+}
+static double mech_dot(int t, int h, double futsum_extra, const double *fut) {
+    double a = -1, b = -1;
+    int e = t + h;   /* the last minute of the future windows */
+    for (int wi = 0; wi < 2; wi++) {
+        int w = wi ? 120 : 60;
+        if (e + 1 < 2 * w) continue;
+        /* exactly the live ranking at minute E: every window ending up to E,
+         * the known ones and the H forecast ones, the target among them */
+        double cur = win_sum(w, t, h, e, futsum_extra, fut);
+        int tot = 0, ge = 0;
+        for (int i = 0; i + w <= t + 1; i++) { tot++; if (psum[i + w] - psum[i] >= cur - 1e-9) ge++; }
+        for (int k = 1; k <= h; k++) { tot++; if (win_sum(w, t, h, t + k, futsum_extra, fut) >= cur - 1e-9) ge++; }
+        double r = (double) ge / tot;
+        if (wi) b = r; else a = r;
+    }
+    if (a < 0) return b;
+    if (b < 0) return a;
+    return fabs(b - 0.5) > fabs(a - 0.5) ? b : a;
+}
+#define NQ 21
+/* Band probabilities for H minutes after minute T: the point forecast's
+ * dot shifted by NQ quantiles of the forecaster's past H-step summed errors
+ * (pairs whose outcome was known by T). Returns the point forecast's dot. */
+static double mech_forecast(int method, int t, int h, double p[NBANDS]) {
+    double fut[64], e[1200]; int ne = 0;
+    if (h > 64) h = 64;
+    for (int b = 0; b < NBANDS; b++) p[b] = 0;
+    nv_forecast(method, t, h, fut);
+    for (int s = t - h; s >= 130 && ne < 1200; s -= 1) {
+        double f2[64], sf = 0, sa = 0;
+        nv_forecast(method, s, h, f2);
+        for (int k = 0; k < h; k++) { sf += f2[k]; sa += sval[s + 1 + k]; }
+        e[ne++] = sa - sf;
+    }
+    double point = mech_dot(t, h, 0, fut);
+    if (ne < 50) { if (point >= 0) p[band_of(point)] = 1; return point; }
+    /* quantiles of the errors (sorted copy) */
+    for (int i = 1; i < ne; i++) { double v = e[i]; int j = i - 1; while (j >= 0 && e[j] > v) { e[j + 1] = e[j]; j--; } e[j + 1] = v; }
+    for (int q = 0; q < NQ; q++) {
+        double err = e[(int) ((q + 0.5) / NQ * ne)];
+        double d = mech_dot(t, h, err, fut);   /* the error added once: every window holds all H future minutes */
+        if (d >= 0) p[band_of(d)] += 1.0 / NQ;
+    }
+    double tot = 0; for (int b = 0; b < NBANDS; b++) { p[b] = p[b] * 0.98 + 0.02 / NBANDS; tot += p[b]; }
+    for (int b = 0; b < NBANDS; b++) p[b] /= tot;
+    return point;
+}
+/* The mechanistic forecast on the stored series against persistence: the
+ * point band right overall, on the band changes (recall) and among the
+ * changes it called (precision), and the probabilities' log loss. */
+static int cmd_mech(int h) {
+    series_load(); dots_sync(); psum_sync();
+    for (int m = 0; m < 4; m++) {
+        int n = 0, ok = 0, pok = 0, ch = 0, chok = 0, called = 0, calledok = 0; double ll = 0;
+        for (int t = 300; t + h < gdn; t += 2) {
+            if (gdot[t] < 0 || gdot[t + h] < 0) continue;
+            double p[NBANDS];
+            double d = mech_forecast(m, t, h, p);
+            if (d < 0) continue;
+            int act = band_of(gdot[t + h]), now_b = band_of(gdot[t]), pr = band_of(d);
+            n++; ok += pr == act; pok += now_b == act; ll += ll_of(p, act);
+            if (act != now_b) { ch++; chok += pr == act; }
+            if (pr != now_b) { called++; calledok += pr == act; }
+        }
+        static const char *nm[4] = { "last value", "5-min trend", "AR(2) on changes", "ORACLE (actual)" };
+        printf("%d min ahead, netvar by %-17s %d minutes: right %.1f%% (persistence %.1f%%); band changes %d, caught %d (%.1f%%); changes called %d, right %d (%.1f%%); log loss %.3f\n",
+               h, nm[m], n, 100.0 * ok / n, 100.0 * pok / n, ch, chok, ch ? 100.0 * chok / ch : 0, called, calledok, called ? 100.0 * calledok / called : 0, ll / n);
+    }
+    /* A change called only when the AR(2) forecast gives the band now at
+     * most 1 - THETA (a change at least THETA), the band called being the
+     * likeliest other one: catches against false alarms. */
+    static const double th[] = { 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9 };
+    for (size_t k = 0; k < sizeof th / sizeof *th; k++) {
+        int ch = 0, chok = 0, called = 0, calledok = 0;
+        for (int t = 300; t + h < gdn; t += 2) {
+            if (gdot[t] < 0 || gdot[t + h] < 0) continue;
+            double p[NBANDS];
+            if (mech_forecast(2, t, h, p) < 0) continue;
+            int act = band_of(gdot[t + h]), now_b = band_of(gdot[t]);
+            int other = -1; for (int b = 0; b < NBANDS; b++) if (b != now_b && (other < 0 || p[b] > p[other])) other = b;
+            int call = 1 - p[now_b] >= th[k];
+            if (act != now_b) { ch++; chok += call && other == act; }
+            if (call) { called++; calledok += other == act; }
+        }
+        printf("  change called at P(change) >= %.1f: caught %d of %d (%.1f%%), called %d, right %d (%.1f%%)\n", th[k], chok, ch, ch ? 100.0 * chok / ch : 0, called, calledok, called ? 100.0 * calledok / called : 0);
+    }
+    return 0;
+}
+
 static int cmd_backtest(int h) {
     series_load();
     dots_sync();
@@ -1113,6 +1281,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     paths();
     if (argc > 1 && !strcmp(argv[1], "score")) return cmd_score();
+    if (argc > 1 && !strcmp(argv[1], "mech")) return cmd_mech(argc > 2 ? atoi(argv[2]) : 2);
     if (argc > 1 && !strcmp(argv[1], "show")) return cmd_show();
     if (argc > 1 && !strcmp(argv[1], "backtest")) return cmd_backtest(argc > 2 ? atoi(argv[2]) : 4);
     if (argc > 1 && !strcmp(argv[1], "dot")) return cmd_dot();
@@ -1206,6 +1375,7 @@ int main(int argc, char **argv) {
             /* New minutes resolve the forecasts made for them: scored, and
              * the blend refitted. */
             if (a > 0) { dots_sync(); int before = rn; load_resolved(); if (rn != before) refit(); }
+            if (a > 0 || !alert_ok) { psum_sync(); if (sn > 300 && mech_forecast(2, sn - 1, 2, alert_p) >= 0) { alert_at = sep[sn - 1] + 120; alert_ok = 1; } }
             else say("feed: no answer (keeping the series as it is)");
         }
         double dot = dot_now();
@@ -1336,7 +1506,12 @@ int main(int argc, char **argv) {
                  * resolved forecast; the band is drawn from the blend. */
                 dots_sync();
                 double pa[NBANDS], pf[NBANDS];
-                double neff = anchored(sn - 1, hmin, pa);
+                /* the mechanistic forecast: the dot rebuilt from the known
+                 * minutes and an AR(2) netvar forecast, ranked as the live
+                 * dot is (oracle check 100%); backtest at 2 min: 98% right,
+                 * band changes caught 88%, log loss 0.062 */
+                psum_sync();
+                double neff = mech_forecast(2, sn - 1, hmin, pa) >= 0 ? 100 : 0;
                 int has_a = neff >= 3;
                 if (from_jev || has_a) pool(probs, from_jev, pa, has_a, blend_a, blend_c, pf);
                 else for (int b = 0; b < NBANDS; b++) pf[b] = probs[b];
