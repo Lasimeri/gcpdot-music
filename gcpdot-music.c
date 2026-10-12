@@ -947,6 +947,43 @@ static const double band_mid[NBANDS] = { 0.03, 0.07, 0.25, 0.65, 0.925, 0.97 };
 /* The change alert: the mechanistic forecast 2 minutes past the newest
  * minute, made whenever new minutes arrive (not only per song). */
 static double alert_p[NBANDS]; static long alert_at; static int alert_ok;
+
+/* Live scoring of the alert: every alert (alerts.tsv: made, target minute,
+ * band then, six probabilities) is scored once its target minute is in the
+ * series, over the last 24 h: the top band right, band changes caught by an
+ * alert (P(change) >= 0.6, the right band), alerts right, log loss. */
+struct live { int n, ok, ch, caught, calls, callok; double ll; };
+static struct live live24;
+static int minute_index(long e);
+static void alert_log(long made, long target, int now_b, const double p[NBANDS]) {
+    char p2[700]; snprintf(p2, sizeof p2, "%s/alerts.tsv", statedir);
+    FILE *f = fopen(p2, "a");
+    if (!f) return;
+    fprintf(f, "%ld\t%ld\t%d", made, target, now_b);
+    for (int b = 0; b < NBANDS; b++) fprintf(f, "\t%.4f", p[b]);
+    fprintf(f, "\n");
+    fclose(f);
+}
+static void alert_score(void) {
+    char p2[700]; snprintf(p2, sizeof p2, "%s/alerts.tsv", statedir);
+    memset(&live24, 0, sizeof live24);
+    FILE *f = fopen(p2, "r");
+    if (!f || !sn) { if (f) fclose(f); return; }
+    long newest = sep[sn - 1], made, target; int nb; double p[NBANDS];
+    while (fscanf(f, "%ld %ld %d %lf %lf %lf %lf %lf %lf", &made, &target, &nb, &p[0], &p[1], &p[2], &p[3], &p[4], &p[5]) == 9) {
+        if (target > newest || target < newest - 86400 || nb < 0 || nb >= NBANDS) continue;
+        int i = minute_index(target);
+        if (i < 0 || i >= gdn || gdot[i] < 0) continue;
+        int act = band_of(gdot[i]), top = 0, ob = -1;
+        for (int b = 1; b < NBANDS; b++) if (p[b] > p[top]) top = b;
+        for (int b = 0; b < NBANDS; b++) if (b != nb && (ob < 0 || p[b] > p[ob])) ob = b;
+        int call = 1 - p[nb] >= 0.6;
+        live24.n++; live24.ok += top == act; live24.ll -= log(p[act] > 1e-6 ? p[act] : 1e-6);
+        if (act != nb) { live24.ch++; live24.caught += call && ob == act; }
+        if (call) { live24.calls++; live24.callok += ob == act; }
+    }
+    fclose(f);
+}
 static void write_dots(double gcp, double ref, const double pf[NBANDS], int have_pred, long pred_at, int pred_src_jev) {
     char p[700], t[720]; snprintf(p, sizeof p, "%s/dots", statedir); snprintf(t, sizeof t, "%s.new", p);
     FILE *f = fopen(t, "w");
@@ -957,6 +994,7 @@ static void write_dots(double gcp, double ref, const double pf[NBANDS], int have
         for (int b = 0; b < NBANDS; b++) fprintf(f, "%s%.4f", b ? " " : "", pf[b]);
         fprintf(f, "\n");
     }
+    if (live24.n) fprintf(f, "live=%d %d %d %d %d %d %.4f\n", live24.n, live24.ok, live24.ch, live24.caught, live24.calls, live24.callok, live24.ll / live24.n);
     if (alert_ok) {
         fprintf(f, "alert_at=%ld\nalert=", alert_at);
         for (int b = 0; b < NBANDS; b++) fprintf(f, "%s%.4f", b ? " " : "", alert_p[b]);
@@ -993,6 +1031,7 @@ static int cmd_show(void) {
     while (!stop) {
         double gcp = -1, ref = -1, pred[NBANDS] = { 0 }; long t = 0, latest = 0, pred_at = 0; int havep = 0;
         char src[32] = "", lastp[16] = "", lasta[16] = ""; long last_tgt = 0, alert_at2 = 0; double al[NBANDS] = { 0 }; int haveal = 0;
+        int ln = 0, lok = 0, lch = 0, lcaught = 0, lcalls = 0, lcallok = 0; double lll = 0;
         FILE *f = fopen(p, "r");
         if (f) {
             char line[256];
@@ -1002,6 +1041,7 @@ static int cmd_show(void) {
                 if (sscanf(line, "pred_src=%31[^\n]", src) == 1) continue;
                 if (sscanf(line, "last_target=%ld", &last_tgt) == 1 || sscanf(line, "last_pred=%15s", lastp) == 1 || sscanf(line, "last_actual=%15s", lasta) == 1) continue;
                 if (sscanf(line, "alert_at=%ld", &alert_at2) == 1) continue;
+                if (sscanf(line, "live=%d %d %d %d %d %d %lf", &ln, &lok, &lch, &lcaught, &lcalls, &lcallok, &lll) == 7) continue;
                 if (!strncmp(line, "alert=", 6)) { haveal = sscanf(line + 6, "%lf %lf %lf %lf %lf %lf", &al[0], &al[1], &al[2], &al[3], &al[4], &al[5]) == 6; continue; }
                 if (!strncmp(line, "pred=", 5)) havep = sscanf(line + 5, "%lf %lf %lf %lf %lf %lf", &pred[0], &pred[1], &pred[2], &pred[3], &pred[4], &pred[5]) == 6;
             }
@@ -1063,6 +1103,9 @@ static int cmd_show(void) {
         else printf("warming up");
         char ltm[8] = "-"; if (last_tgt) { time_t tt2 = last_tgt; strftime(ltm, sizeof ltm, "%H:%M", localtime(&tt2)); }
         if (lastp[0]) printf("\033[21;3Hlast %s: forecast %s, live %s %s", ltm, lastp, lasta, strcmp(lastp, lasta) ? "\033[38;2;255;80;80mmiss" : "\033[38;2;100;250;100mhit");
+        /* the alert's live record, last 24 h */
+        if (ln) printf("\033[22;3H\033[38;2;138;106;62mlive 24h %d%% right, changes %d/%d, alerts %d/%d", 100 * lok / ln, lcaught, lch, lcallok, lcalls);
+        else printf("\033[22;3H\033[38;2;100;100;100mlive record: waiting for scored alerts");
         printf("\033[0m");
         fflush(stdout);
         for (int i = 0; i < 20 && !stop; i++) usleep(100000);
@@ -1111,6 +1154,9 @@ static int cmd_score(void) {
     prefs_load();
     int sk = 0, rp = 0;
     for (int i = 0; i < npref; i++) { sk += prefs[i].skips; rp += prefs[i].replays; }
+    alert_score();
+    if (live24.n) printf("live 2-minute alerts, last 24 h: %d scored, %.1f%% right; band changes %d, caught %d (%.1f%%); alerts %d, right %d (%.1f%%); log loss %.3f\n", live24.n, 100.0 * live24.ok / live24.n, live24.ch, live24.caught, live24.ch ? 100.0 * live24.caught / live24.ch : 0, live24.calls, live24.callok, live24.calls ? 100.0 * live24.callok / live24.calls : 0, live24.ll / live24.n);
+    else printf("live 2-minute alerts: none scored yet (alerts.tsv)\n");
     printf("skips %d and replays %d over %d songs (prefs.tsv); in the draw a song weighs exp(0.6 replays - 0.8 skips), at least 0.05\n", sk, rp, npref);
     return 0;
 }
@@ -1186,6 +1232,11 @@ static void nv_forecast(int method, int t, int h, double *out) {
     if (method == 0 || t < 6) { for (int k = 0; k < h; k++) out[k] = sval[t]; return; }
     if (method == 1) { double s = (sval[t] - sval[t - 5]) / 5; for (int k = 0; k < h; k++) out[k] = sval[t] + (k + 1) * s; return; }
     if (method == 4 && t > VM_M + 30) { veridical(t, h, out); return; }
+    if (method == 7 && t > VM_M + 30) {   /* the two averaged: AR(2) and veridical mapping */
+        double o2[64]; ar2(t, h, 600, out); veridical(t, h, o2);
+        for (int k = 0; k < h; k++) out[k] = 0.5 * (out[k] + o2[k]);
+        return;
+    }
     ar2(t, h, method == 5 ? 120 : 600, out);
 }
 /* The dot H minutes after minute T, from the known minutes and FUT (the
@@ -1233,7 +1284,7 @@ static double mech_forecast(int method, int t, int h, double p[NBANDS]) {
     /* the veridical matcher is slow: its error history thinned (every 4th
      * minute, at most 300); method 6 keeps only the same hours of the day
      * (within 2 h, circular), falling back to all when under 50 */
-    int step = method == 4 ? 4 : 1, cap = method == 4 ? 300 : 1200;
+    int step = method == 4 || method == 7 ? 4 : 1, cap = method == 4 || method == 7 ? 300 : 1200;
     for (int pass = 0; pass < 2 && ne < 50; pass++) {
         ne = 0;
         for (int s = t - h; s >= 130 && ne < cap; s -= step) {
@@ -1264,9 +1315,10 @@ static double mech_forecast(int method, int t, int h, double p[NBANDS]) {
 /* The mechanistic forecast on the stored series against persistence: the
  * point band right overall, on the band changes (recall) and among the
  * changes it called (precision), and the probabilities' log loss. */
-static int cmd_mech(int h) {
+static int cmd_mech(int h, int only) {
     series_load(); dots_sync(); psum_sync();
-    for (int m = 0; m < 7; m++) {
+    for (int m = 0; m < 8; m++) {
+        if (only >= 0 && m != only) continue;
         int n = 0, ok = 0, pok = 0, ch = 0, chok = 0, called = 0, calledok = 0; double ll = 0;
         for (int t = 300; t + h < gdn; t += 2) {
             if (gdot[t] < 0 || gdot[t + h] < 0) continue;
@@ -1278,7 +1330,7 @@ static int cmd_mech(int h) {
             if (act != now_b) { ch++; chok += pr == act; }
             if (pr != now_b) { called++; calledok += pr == act; }
         }
-        static const char *nm[7] = { "last value", "5-min trend", "AR(2) on changes", "ORACLE (actual)", "veridical mapping", "AR(2) hypo-priors", "AR(2) + time of day" };
+        static const char *nm[8] = { "last value", "5-min trend", "AR(2) on changes", "ORACLE (actual)", "veridical mapping", "AR(2) hypo-priors", "AR(2) + time of day", "AR(2) + veridical" };
         printf("%d min ahead, netvar by %-17s %d minutes: right %.1f%% (persistence %.1f%%); band changes %d, caught %d (%.1f%%); changes called %d, right %d (%.1f%%); log loss %.3f\n",
                h, nm[m], n, 100.0 * ok / n, 100.0 * pok / n, ch, chok, ch ? 100.0 * chok / ch : 0, called, calledok, called ? 100.0 * calledok / called : 0, ll / n);
     }
@@ -1291,7 +1343,7 @@ static int cmd_mech(int h) {
         for (int t = 300; t + h < gdn; t += 2) {
             if (gdot[t] < 0 || gdot[t + h] < 0) continue;
             double p[NBANDS];
-            if (mech_forecast(2, t, h, p) < 0) continue;
+            if (mech_forecast(only >= 0 ? only : 2, t, h, p) < 0) continue;
             int act = band_of(gdot[t + h]), now_b = band_of(gdot[t]);
             int other = -1; for (int b = 0; b < NBANDS; b++) if (b != now_b && (other < 0 || p[b] > p[other])) other = b;
             int call = 1 - p[now_b] >= th[k];
@@ -1334,7 +1386,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     paths();
     if (argc > 1 && !strcmp(argv[1], "score")) return cmd_score();
-    if (argc > 1 && !strcmp(argv[1], "mech")) return cmd_mech(argc > 2 ? atoi(argv[2]) : 2);
+    if (argc > 1 && !strcmp(argv[1], "mech")) return cmd_mech(argc > 2 ? atoi(argv[2]) : 2, argc > 3 ? atoi(argv[3]) : -1);
     if (argc > 1 && !strcmp(argv[1], "show")) return cmd_show();
     if (argc > 1 && !strcmp(argv[1], "backtest")) return cmd_backtest(argc > 2 ? atoi(argv[2]) : 4);
     if (argc > 1 && !strcmp(argv[1], "dot")) return cmd_dot();
@@ -1428,7 +1480,14 @@ int main(int argc, char **argv) {
             /* New minutes resolve the forecasts made for them: scored, and
              * the blend refitted. */
             if (a > 0) { dots_sync(); int before = rn; load_resolved(); if (rn != before) refit(); }
-            if (a > 0 || !alert_ok) { psum_sync(); if (sn > 300 && mech_forecast(2, sn - 1, 2, alert_p) >= 0) { alert_at = sep[sn - 1] + 120; alert_ok = 1; } }
+            if (a > 0 || !alert_ok) {
+                psum_sync();
+                if (sn > 300 && mech_forecast(2, sn - 1, 2, alert_p) >= 0) {
+                    if (!alert_ok || alert_at != sep[sn - 1] + 120) alert_log((long) now, sep[sn - 1] + 120, band_of(dot_now()), alert_p);
+                    alert_at = sep[sn - 1] + 120; alert_ok = 1;
+                }
+                alert_score();
+            }
             else say("feed: no answer (keeping the series as it is)");
         }
         double dot = dot_now();
