@@ -77,3 +77,11 @@ the last 50 starting again. Each is logged (`K` and `R` lines in predictions.tsv
 `prefs.tsv`; within a band, a song's weight in the draw is exp(0.6 x replays - 0.8 x skips), at least
 0.05, so skipped songs come back less and replayed ones more. The daemon's own cuts (`switch=now`) are
 not counted. `gcpdot-music score` prints the totals.
+
+## The display
+
+`gcpdot-show [OUTPUT]` opens `gcpdot-music show` in a small Alacritty window (44 x 22; Konsole when there
+is no Alacritty) and moves it to the bottom-right corner of OUTPUT (default DP-2) with a one-shot KWin
+script. It shows the GCP dot now and the predicted one, in the old gcpdot's colours, the forecast per band,
+the reference egg's dot and whether the last forecast hit; it reads `~/.local/state/gcpdot-music/dots`,
+which the daemon rewrites every loop, every 2 s.

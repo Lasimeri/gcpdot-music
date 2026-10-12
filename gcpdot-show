@@ -1,0 +1,38 @@
+#!/bin/sh
+# gcpdot-show: the GCP dot display (gcpdot-music show) in a small terminal
+# window (Alacritty, 44 x 22, else Konsole), moved to the bottom-right
+# corner of an output (default DP-2, the left monitor) by a one-shot KWin
+# script once its title reads "GCP dot".
+#   gcpdot-show [OUTPUT]
+out=${1:-DP-2}
+w=0 h=0
+if ! ps -eo args | grep -q '^[^ ]*gcpdot-music show$'; then
+    if command -v alacritty > /dev/null; then
+        setsid alacritty --title "GCP dot" --class gcpdot -o window.dimensions.columns=44 -o window.dimensions.lines=22 \
+            -o 'colors.primary.background="#0a0a0f"' -e gcpdot-music show > /dev/null 2>&1 < /dev/null &
+    else
+        setsid konsole --separate --hide-menubar --hide-tabbar -p LocalTabTitleFormat=%w -p RemoteTabTitleFormat=%w \
+            -e gcpdot-music show > /dev/null 2>&1 < /dev/null &
+        w=440 h=520   # Konsole opens at its last window size: set one
+    fi
+fi
+js=$(mktemp --suffix=.js)
+cat > "$js" <<JS
+const out = "$out", fw = $w, fh = $h;
+let area = null;
+for (const s of workspace.screens) if (s.name === out) area = s.geometry;
+if (area) for (const win of workspace.windowList()) {
+    if (win.caption.indexOf("GCP dot") === 0) {
+        const g = win.frameGeometry, W = fw || g.width, H = fh || g.height;
+        win.frameGeometry = { x: area.x + area.width - W, y: area.y + area.height - H, width: W, height: H };
+    }
+}
+JS
+# The window and its title appear a moment after the start.
+for i in 1 2 3 4 5 6; do
+    sleep 0.5
+    id=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$js" gcpdot-place 2> /dev/null) || continue
+    qdbus6 org.kde.KWin "/Scripting/Script$id" org.kde.kwin.Script.run > /dev/null 2>&1
+    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript gcpdot-place > /dev/null 2>&1
+done
+rm -f "$js"

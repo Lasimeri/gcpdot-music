@@ -873,6 +873,113 @@ static double ll_of(const double p[NBANDS], int a) { return -log(p[a] > 1e-6 ? p
  * (lower is better; a fair six-way guess is 1.79), for persistence (the band
  * when asked), Jev, the analog model and the blend; and the same on the
  * songs where the band changed, the only ones persistence gets wrong. */
+/* ---- the display: the GCP dot now and the predicted one ----
+ * The daemon writes dots (key=value) every loop; `gcpdot-music show` draws
+ * it in a terminal, the dots in the old gcpdot's colours (quartzjer's table
+ * of gcpdot.com's: by index, red for a low one through green to blue). */
+static const struct { double at; unsigned rgb; } dot_col[] = {
+    { 0.00, 0xCDCDCD }, { 0.01, 0xFFA8C0 }, { 0.05, 0xFF1E1E }, { 0.08, 0xFFB82E }, { 0.15, 0xFFD517 }, { 0.23, 0xFFFA40 },
+    { 0.30, 0xF9FA00 }, { 0.40, 0xAEFA00 }, { 0.90, 0x64FA64 }, { 0.9125, 0x64FAAB }, { 0.93, 0xACF2FF }, { 0.95, 0x0EEEFF }, { 1.00, 0x24CBFD },
+};
+static unsigned colour_of(double x) {
+    unsigned c = dot_col[0].rgb;
+    for (size_t i = 0; i < sizeof dot_col / sizeof *dot_col; i++) if (x >= dot_col[i].at) c = dot_col[i].rgb;
+    return c;
+}
+/* A band's colour: the colour at the middle of its index range. */
+static const double band_mid[NBANDS] = { 0.03, 0.07, 0.25, 0.65, 0.925, 0.97 };
+
+static void write_dots(double gcp, double ref, const double pf[NBANDS], int have_pred, long pred_at, int pred_src_jev) {
+    char p[700], t[720]; snprintf(p, sizeof p, "%s/dots", statedir); snprintf(t, sizeof t, "%s.new", p);
+    FILE *f = fopen(t, "w");
+    if (!f) return;
+    fprintf(f, "time=%ld\ngcp=%.4f\nlatest_minute=%ld\nref=%.4f\n", (long) time(NULL), gcp, sn ? sep[sn - 1] : 0L, ref);
+    if (have_pred) {
+        fprintf(f, "pred_at=%ld\npred_src=%s\npred=", pred_at, pred_src_jev ? "Jev + analog" : "analog");
+        for (int b = 0; b < NBANDS; b++) fprintf(f, "%s%.4f", b ? " " : "", pf[b]);
+        fprintf(f, "\n");
+    }
+    if (rn) {
+        struct res *r = &rs[rn - 1];
+        fprintf(f, "last_pred=%s\nlast_actual=%s\n", band_name[r->has_f ? top_of(r->pf) : r->has_j ? top_of(r->pj) : r->now_b], band_name[r->act]);
+    }
+    fclose(f);
+    rename(t, p);
+}
+
+/* A filled circle, D pixels across, two pixels a cell (upper half block),
+ * drawn at the cursor's row and column COL. */
+static void draw_disc(int row, int col, int d, unsigned rgb, unsigned bg) {
+    double r = d / 2.0;
+    for (int y = 0; y < d; y += 2) {
+        printf("\033[%d;%dH", row + y / 2, col);
+        for (int x = 0; x < d; x++) {
+            double dx = x + 0.5 - r, dy0 = y + 0.5 - r, dy1 = y + 1.5 - r;
+            unsigned top = dx * dx + dy0 * dy0 <= r * r ? rgb : bg, bot = dx * dx + dy1 * dy1 <= r * r ? rgb : bg;
+            printf("\033[38;2;%u;%u;%um\033[48;2;%u;%u;%um▀", top >> 16, (top >> 8) & 255, top & 255, bot >> 16, (bot >> 8) & 255, bot & 255);
+        }
+    }
+    printf("\033[0m");
+}
+
+static int cmd_show(void) {
+    char p[700]; snprintf(p, sizeof p, "%s/dots", statedir);
+    printf("\033]0;GCP dot\007\033[?25l");   /* the window title (the KWin rule matches it), cursor off */
+    signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
+    const unsigned bg = 0x0A0A0F;
+    while (!stop) {
+        double gcp = -1, ref = -1, pred[NBANDS] = { 0 }; long t = 0, latest = 0, pred_at = 0; int havep = 0;
+        char src[32] = "", lastp[16] = "", lasta[16] = "";
+        FILE *f = fopen(p, "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof line, f)) {
+                if (sscanf(line, "time=%ld", &t) == 1 || sscanf(line, "gcp=%lf", &gcp) == 1 || sscanf(line, "latest_minute=%ld", &latest) == 1 ||
+                    sscanf(line, "ref=%lf", &ref) == 1 || sscanf(line, "pred_at=%ld", &pred_at) == 1) continue;
+                if (sscanf(line, "pred_src=%31[^\n]", src) == 1) continue;
+                if (sscanf(line, "last_pred=%15s", lastp) == 1 || sscanf(line, "last_actual=%15s", lasta) == 1) continue;
+                if (!strncmp(line, "pred=", 5)) havep = sscanf(line + 5, "%lf %lf %lf %lf %lf %lf", &pred[0], &pred[1], &pred[2], &pred[3], &pred[4], &pred[5]) == 6;
+            }
+            fclose(f);
+        }
+        long now = time(NULL);
+        printf("\033[48;2;10;10;15m\033[2J\033[H\033[38;2;196;148;90m gcp dot\033[0m");
+        if (!f || now - t > 30) printf("\033[38;2;138;106;62m  (daemon not writing: systemctl --user status gcpdot-music)\033[0m");
+        /* the two dots */
+        int pb = havep ? top_of(pred) : -1;
+        draw_disc(3, 3, 12, gcp >= 0 ? colour_of(gcp) : 0x333333, bg);
+        draw_disc(3, 20, 12, pb >= 0 ? colour_of(band_mid[pb]) : 0x333333, bg);
+        printf("\033[48;2;10;10;15m\033[38;2;220;220;220m");
+        printf("\033[10;3H now  %s", gcp >= 0 ? "" : "-");
+        if (gcp >= 0) printf("%.3f %s", gcp, band_name[band_of(gcp)]);
+        printf("\033[10;20H next ");
+        if (pb >= 0) printf("%s %.0f%%", band_name[pb], 100 * pred[pb]); else printf("-");
+        printf("\033[11;3H\033[38;2;138;106;62m%ld min old", latest ? (now - latest) / 60 : 0);
+        if (pb >= 0) {
+            long in = pred_at - now;
+            printf("\033[11;20H%s", in > 0 ? "" : "due ");
+            if (in > 0) printf("in %ld:%02ld", in / 60, in % 60);
+            /* the forecast per band */
+            for (int b = 0; b < NBANDS; b++) {
+                unsigned c = colour_of(band_mid[b]); int w = (int) (pred[b] * 20 + 0.5);
+                printf("\033[%d;3H\033[38;2;150;150;150m%-6s \033[38;2;%u;%u;%um", 13 + b, band_name[b], c >> 16, (c >> 8) & 255, c & 255);
+                for (int i = 0; i < w; i++) printf("█");
+                printf("\033[38;2;150;150;150m %.2f", pred[b]);
+            }
+            printf("\033[19;3H\033[38;2;138;106;62m%s", src);
+        }
+        printf("\033[20;3H\033[38;2;150;150;150mreference ");
+        if (ref >= 0) { unsigned c = colour_of(ref); printf("\033[38;2;%u;%u;%um●\033[38;2;150;150;150m %.3f %s", c >> 16, (c >> 8) & 255, c & 255, ref, band_name[band_of(ref)]); }
+        else printf("warming up");
+        if (lastp[0]) printf("\033[21;3Hlast: %s, was %s %s", lastp, lasta, strcmp(lastp, lasta) ? "\033[38;2;255;80;80mmiss" : "\033[38;2;100;250;100mhit");
+        printf("\033[0m");
+        fflush(stdout);
+        for (int i = 0; i < 20 && !stop; i++) usleep(100000);
+    }
+    printf("\033[0m\033[?25h\033[2J\033[H");
+    return 0;
+}
+
 static int cmd_score(void) {
     load_resolved();
     if (!rn) { printf("no resolved forecasts yet (%s/predictions.tsv)\n", statedir); return 1; }
@@ -933,6 +1040,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     paths();
     if (argc > 1 && !strcmp(argv[1], "score")) return cmd_score();
+    if (argc > 1 && !strcmp(argv[1], "show")) return cmd_show();
     if (argc > 1 && !strcmp(argv[1], "backtest")) return cmd_backtest(argc > 2 ? atoi(argv[2]) : 4);
     if (argc > 1 && !strcmp(argv[1], "dot")) return cmd_dot();
     if (argc > 1 && !strcmp(argv[1], "compare")) return cmd_compare();
@@ -942,7 +1050,7 @@ int main(int argc, char **argv) {
         char b[4096]; size_t n = fread(b, 1, sizeof b - 1, f); b[n] = 0; fclose(f); fputs(b, stdout);
         return 0;
     }
-    if (argc > 1) { fprintf(stderr, "gcpdot-music [dot|compare|score|backtest [MIN]|status]\n"); return 2; }
+    if (argc > 1) { fprintf(stderr, "gcpdot-music [show|dot|compare|score|backtest [MIN]|status]\n"); return 2; }
 
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     load_conf();
@@ -957,6 +1065,21 @@ int main(int argc, char **argv) {
     say("skips and replays known for %d songs", npref);
     char prev_id[96] = "", prev_url[4096] = "", *played[50] = { 0 };
     int64_t prev_len = 0, prev_pos = 0, prev_obs = 0; int prev_playing = 0;
+    double last_pf[NBANDS] = { 0 }; long last_pred_at = 0; int last_pred = 0, last_pred_jev = 0;   /* for the display */
+    {   /* the last forecast logged, so the display has one at once after a restart */
+        char lpp[700]; snprintf(lpp, sizeof lpp, "%s/predictions.tsv", statedir);
+        FILE *q = fopen(lpp, "r");
+        char line[8192];
+        while (q && fgets(line, sizeof line, q)) {
+            char *fld[40]; int nf = 0;
+            for (char *s = strtok(line, "\t\n"); s && nf < 40; s = strtok(NULL, "\t\n")) fld[nf++] = s;
+            if (nf >= 28 && !strcmp(fld[0], "Q")) {
+                for (int b = 0; b < NBANDS; b++) last_pf[b] = atof(fld[22 + b]);
+                last_pred_at = atol(fld[1]) + (long) (atof(fld[3]) * 60); last_pred = 1; last_pred_jev = !strcmp(fld[6], "jev");
+            }
+        }
+        if (q) fclose(q);
+    }
     pthread_t egg;
     if (pthread_create(&egg, NULL, egg_thread, NULL)) { say("the reference egg did not start"); return 1; }
     say("reference egg: %d minutes kept, one 200-bit RDSEED trial a second from now", esn);
@@ -1149,6 +1272,7 @@ int main(int argc, char **argv) {
                         snprintf(queued_id, sizeof queued_id, "%s", id);
                         snprintf(queued_uri, sizeof queued_uri, "%s", u);
                         queued_band = nb;
+                        memcpy(last_pf, pf, sizeof last_pf); last_pred_at = (long) now + (long) (left * 60); last_pred = 1; last_pred_jev = from_jev;
                         FILE *q = fopen(qp, "w");
                         if (q) { fprintf(q, "%s\t%s\t%d\n", id, u, nb); fclose(q); }
                         logline("Q\t%ld\t%s\t%.1f\t%.4f\t%s\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%s\t%s\t%ld"
@@ -1169,6 +1293,7 @@ int main(int argc, char **argv) {
         last_band = band;
         long em = egg_latest();
         double rdot = em ? egg_dot_at(em) : -1;
+        write_dots(dot, rdot, last_pf, last_pred, last_pred_at, last_pred_jev);
         char ref[160];
         if (rdot >= 0) snprintf(ref, sizeof ref, "%.3f (%s) at the minute ending %ld", rdot, band_name[band_of(rdot)], em);
         else snprintf(ref, sizeof ref, "under an hour of trials yet (%ld trials, last z %+.2f)", egg_trials, egg_last_z);

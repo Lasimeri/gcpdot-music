@@ -8,6 +8,7 @@ gcpdot-music: gcpdot-music.c
 
 install: gcpdot-music
 	install -Dm755 gcpdot-music $(PREFIX)/bin/gcpdot-music
+	install -Dm755 gcpdot-show $(PREFIX)/bin/gcpdot-show
 	install -Dm644 gcpdot-music.service $(UNITDIR)/gcpdot-music.service
 	systemctl --user daemon-reload
 
