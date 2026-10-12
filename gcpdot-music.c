@@ -280,8 +280,25 @@ static void series_load(void) {
     }
     fclose(f);
 }
+/* What the main loop is waiting on (busy: start time, what), for the
+ * display: a long wait (a Jev question, the feed's rate limit) is not a
+ * daemon that stopped. */
+static void busy(const char *what) {
+    char p[700]; snprintf(p, sizeof p, "%s/busy", statedir);
+    FILE *f = fopen(p, "w");
+    if (f) { fprintf(f, "%ld\t%s\n", (long) time(NULL), what); fclose(f); }
+}
+static void unbusy(void) { char p[700]; snprintf(p, sizeof p, "%s/busy", statedir); unlink(p); }
+
+static int fetch_inner(void);
 /* New minutes from the 24 h history appended (memory and disk). */
 static int fetch(void) {
+    busy("reading the GCP feed");
+    int r = fetch_inner();
+    unbusy();
+    return r;
+}
+static int fetch_inner(void) {
     if (!token[0] && get_token()) return -1;
     for (int attempt = 0; attempt < 4; attempt++) {
         char cmd[1024];
@@ -300,7 +317,7 @@ static int fetch(void) {
             free(j);
             static const int wait_s[3] = { 5, 15, 30 };
             if (!limited && attempt == 0) get_token();
-            if (attempt < 3) { sleep(limited ? wait_s[attempt] : 3); continue; }
+            if (attempt < 3) { busy(limited ? "waiting out the GCP feed's rate limit" : "reading the GCP feed again"); sleep(limited ? wait_s[attempt] : 3); continue; }
             return -1;
         }
         char p[700]; series_path(p, sizeof p);
@@ -944,7 +961,15 @@ static int cmd_show(void) {
         }
         long now = time(NULL);
         printf("\033[48;2;10;10;15m\033[2J\033[H\033[38;2;196;148;90m GCP 2.0 live dot and its forecast\033[0m");
-        if (!f || now - t > 30) printf("\033[38;2;138;106;62m  (daemon not writing: systemctl --user status gcpdot-music)\033[0m");
+        /* Stale: busy on a long wait (the busy note says which), or, five
+         * minutes on without a note, not writing at all. */
+        if (!f || now - t > 30) {
+            char bp[700], what[128] = ""; long bt = 0; snprintf(bp, sizeof bp, "%s/busy", statedir);
+            FILE *b = fopen(bp, "r");
+            if (b) { if (fscanf(b, "%ld\t%127[^\n]", &bt, what) < 2) what[0] = 0; fclose(b); }
+            if (what[0]) printf("\033[s\033[2;3H\033[38;2;138;106;62m%s, %ld s\033[u\033[0m", what, now - bt);
+            else if (!f || now - t > 300) printf("\033[s\033[2;3H\033[38;2;255;80;80mdaemon not writing: systemctl --user status gcpdot-music\033[u\033[0m");
+        }
         /* the two dots */
         int pb = havep ? top_of(pred) : -1;
         draw_disc(3, 3, 12, gcp >= 0 ? colour_of(gcp) : 0x333333, bg);
@@ -1245,7 +1270,9 @@ int main(int argc, char **argv) {
                  * left it is not asked. A song is queued either way. */
                 int deadline = (int) (left * 60) - 25;
                 if (deadline > 300) deadline = 300;
+                if (use_jev && deadline >= 10) busy("asking Jev");
                 int from_jev = use_jev && deadline >= 10 && ask_jev(left, deadline, probs) == 0;
+                unbusy();
                 if (use_jev && !from_jev) say("Jev %s: queued on the dot's band now", deadline >= 10 ? "did not answer in time" : "not asked (the song ends too soon)");
                 if (!from_jev) { for (int b = 0; b < NBANDS; b++) probs[b] = 0; probs[band] = 1; }
                 /* The analog forecast from the dot's own history, and the
