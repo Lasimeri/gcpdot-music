@@ -530,7 +530,13 @@ static double anchored(int t, int h, double p[NBANDS]) {
 
 /* Resolved forecasts (predictions.tsv: a Q line joined to the S line of its
  * song), for scoring, for refitting the blend and as feedback to Jev. */
-struct res { long t; int now_b, act, has_j, has_a, has_f; double pj[NBANDS], pa[NBANDS], pf[NBANDS]; double h; };
+struct res { long t, target; int now_b, act, act2, has_j, has_a, has_f; double pj[NBANDS], pa[NBANDS], pf[NBANDS]; double h; };
+/* The series index of minute E (an end_epoch), -1 when it is not there. */
+static int minute_index(long e) {
+    int lo = 0, hi = sn - 1;
+    while (lo <= hi) { int m = (lo + hi) / 2; if (sep[m] == e) return m; if (sep[m] < e) lo = m + 1; else hi = m - 1; }
+    return -1;
+}
 static struct res *rs; static int rn, rcap;
 static double blend_a = 0.5, blend_c = 1.0;   /* p ∝ Jev^a * analog^c until refitted */
 static int band_idx(const char *s) { for (int b = 0; b < NBANDS; b++) if (!strcmp(s, band_name[b])) return b; return -1; }
@@ -546,11 +552,34 @@ static void load_resolved(void) {
         for (char *s = strtok(line, "\t\n"); s && nf < 40; s = strtok(NULL, "\t\n")) fld[nf++] = s;
         if (nf >= 15 && !strcmp(fld[0], "Q")) {
             struct res r; memset(&r, 0, sizeof r);
-            r.t = atol(fld[1]); r.h = atof(fld[3]); r.now_b = band_idx(fld[5]);
+            r.t = atol(fld[1]); r.h = atof(fld[3]); r.now_b = band_idx(fld[5]); r.act2 = -1;
+            /* older lines (no target): the minute they were for, rebuilt from
+             * the time, the newest minute's age then and the horizon, to see
+             * how often scoring at the song's start judged another minute */
+            if (nf >= 16 && nf < 32) {
+                int h = (int) (r.h + 0.5); if (h < 1) h = 1;
+                long tg = atol(fld[1]) - atol(fld[15]) + (long) h * 60;   /* the newest minute then, plus h */
+                int i = minute_index(tg);
+                if (i >= 0 && i < gdn && gdot[i] >= 0) r.act2 = band_of(gdot[i]);
+            }
             r.has_j = !strcmp(fld[6], "jev");
             for (int b = 0; b < NBANDS; b++) r.pj[b] = atof(fld[7 + b]);
             if (nf >= 28) { r.has_a = 1; r.has_f = 1; for (int b = 0; b < NBANDS; b++) { r.pa[b] = atof(fld[16 + b]); r.pf[b] = atof(fld[22 + b]); } }
             if (r.has_a) { double t = 0; for (int b = 0; b < NBANDS; b++) t += r.pa[b]; if (t <= 0) r.has_a = r.has_f = 0; }
+            /* A forecast for a set GCP minute (the newest at the time plus
+             * its horizon) is scored on that minute's live dot once the
+             * minute has arrived, whenever that is: not on whatever minute
+             * was newest when the song started, whose lag differs. */
+            if (nf >= 32) {
+                r.target = atol(fld[31]);
+                int i = minute_index(r.target);
+                if (i >= 0 && i < gdn && gdot[i] >= 0 && r.now_b >= 0) {
+                    r.act = band_of(gdot[i]);
+                    if (rn == rcap) { rcap = rcap ? rcap * 2 : 256; rs = realloc(rs, rcap * sizeof *rs); }
+                    rs[rn++] = r;
+                }
+                continue;
+            }
             if (pn == 64) { memmove(pend, pend + 1, 63 * sizeof *pend); memmove(pid, pid + 1, 63 * sizeof *pid); pn = 63; }
             int k = pn++;
             pend[k] = r; snprintf(pid[k], sizeof pid[k], "%s", fld[2]);
@@ -918,7 +947,7 @@ static void write_dots(double gcp, double ref, const double pf[NBANDS], int have
     }
     if (rn) {
         struct res *r = &rs[rn - 1];
-        fprintf(f, "last_pred=%s\nlast_actual=%s\n", band_name[r->has_f ? top_of(r->pf) : r->has_j ? top_of(r->pj) : r->now_b], band_name[r->act]);
+        fprintf(f, "last_target=%ld\nlast_pred=%s\nlast_actual=%s\n", r->target, band_name[r->has_f ? top_of(r->pf) : r->has_j ? top_of(r->pj) : r->now_b], band_name[r->act]);
     }
     fclose(f);
     rename(t, p);
@@ -946,7 +975,7 @@ static int cmd_show(void) {
     const unsigned bg = 0x0A0A0F;
     while (!stop) {
         double gcp = -1, ref = -1, pred[NBANDS] = { 0 }; long t = 0, latest = 0, pred_at = 0; int havep = 0;
-        char src[32] = "", lastp[16] = "", lasta[16] = "";
+        char src[32] = "", lastp[16] = "", lasta[16] = ""; long last_tgt = 0;
         FILE *f = fopen(p, "r");
         if (f) {
             char line[256];
@@ -954,7 +983,7 @@ static int cmd_show(void) {
                 if (sscanf(line, "time=%ld", &t) == 1 || sscanf(line, "gcp=%lf", &gcp) == 1 || sscanf(line, "latest_minute=%ld", &latest) == 1 ||
                     sscanf(line, "ref=%lf", &ref) == 1 || sscanf(line, "pred_at=%ld", &pred_at) == 1) continue;
                 if (sscanf(line, "pred_src=%31[^\n]", src) == 1) continue;
-                if (sscanf(line, "last_pred=%15s", lastp) == 1 || sscanf(line, "last_actual=%15s", lasta) == 1) continue;
+                if (sscanf(line, "last_target=%ld", &last_tgt) == 1 || sscanf(line, "last_pred=%15s", lastp) == 1 || sscanf(line, "last_actual=%15s", lasta) == 1) continue;
                 if (!strncmp(line, "pred=", 5)) havep = sscanf(line + 5, "%lf %lf %lf %lf %lf %lf", &pred[0], &pred[1], &pred[2], &pred[3], &pred[4], &pred[5]) == 6;
             }
             fclose(f);
@@ -979,11 +1008,12 @@ static int cmd_show(void) {
         if (gcp >= 0) printf("%.3f %s", gcp, band_name[band_of(gcp)]);
         printf("\033[10;20H forecast ");
         if (pb >= 0) printf("%s %.0f%%", band_name[pb], 100 * pred[pb]); else printf("-");
-        printf("\033[11;3H\033[38;2;138;106;62m%ld min old", latest ? (now - latest) / 60 : 0);
+        { time_t lt = latest; char lm[8]; strftime(lm, sizeof lm, "%H:%M", localtime(&lt));
+          printf("\033[11;3H\033[38;2;138;106;62m%s, %ld min old", latest ? lm : "-", latest ? (now - latest) / 60 : 0); }
         if (pb >= 0) {
-            long in = pred_at - now;
-            printf("\033[11;20H%s", in > 0 ? "" : "due ");
-            if (in > 0) printf("in %ld:%02ld", in / 60, in % 60);
+            /* the GCP minute it is for (it resolves when that minute arrives) */
+            time_t tt = pred_at; char hm[8]; strftime(hm, sizeof hm, "%H:%M", localtime(&tt));
+            printf("\033[11;20Hfor %s", hm);
             /* the forecast per band */
             for (int b = 0; b < NBANDS; b++) {
                 unsigned c = colour_of(band_mid[b]); int w = (int) (pred[b] * 20 + 0.5);
@@ -996,7 +1026,8 @@ static int cmd_show(void) {
         printf("\033[20;3H\033[38;2;150;150;150mthis PC (reference) ");
         if (ref >= 0) { unsigned c = colour_of(ref); printf("\033[38;2;%u;%u;%um●\033[38;2;150;150;150m %.3f %s", c >> 16, (c >> 8) & 255, c & 255, ref, band_name[band_of(ref)]); }
         else printf("warming up");
-        if (lastp[0]) printf("\033[21;3Hlast forecast %s, live was %s %s", lastp, lasta, strcmp(lastp, lasta) ? "\033[38;2;255;80;80mmiss" : "\033[38;2;100;250;100mhit");
+        char ltm[8] = "-"; if (last_tgt) { time_t tt2 = last_tgt; strftime(ltm, sizeof ltm, "%H:%M", localtime(&tt2)); }
+        if (lastp[0]) printf("\033[21;3Hlast %s: forecast %s, live %s %s", ltm, lastp, lasta, strcmp(lastp, lasta) ? "\033[38;2;255;80;80mmiss" : "\033[38;2;100;250;100mhit");
         printf("\033[0m");
         fflush(stdout);
         for (int i = 0; i < 20 && !stop; i++) usleep(100000);
@@ -1006,7 +1037,7 @@ static int cmd_show(void) {
 }
 
 static int cmd_score(void) {
-    load_resolved();
+    series_load(); dots_sync(); load_resolved();
     if (!rn) { printf("no resolved forecasts yet (%s/predictions.tsv)\n", statedir); return 1; }
     struct { const char *name; int n, ok, xn, xok; double ll; } m[4] = { { "persistence" }, { "Jev" }, { "analog" }, { "blend" } };
     for (int i = 0; i < rn; i++) {
@@ -1025,6 +1056,23 @@ static int cmd_score(void) {
     }
     refit();
     printf("blend now: Jev^%.2f * analog^%.2f\n", blend_a, blend_c);
+    /* How often scoring at the song's start judged another minute than the
+     * one forecast (older lines; newer ones are scored on their minute). */
+    int nk = 0, dis = 0, flip_hit = 0, flip_miss = 0;
+    for (int i = 0; i < rn; i++) {
+        struct res *r = &rs[i];
+        if (r->target || r->act2 < 0) continue;
+        int top = r->has_f ? top_of(r->pf) : r->has_j ? top_of(r->pj) : r->now_b;
+        nk++;
+        if (r->act2 != r->act) {
+            dis++;
+            if (top == r->act && top != r->act2) flip_hit++;    /* counted a hit, was a miss */
+            if (top != r->act && top == r->act2) flip_miss++;   /* counted a miss, was a hit */
+        }
+    }
+    int nt = 0; for (int i = 0; i < rn; i++) nt += rs[i].target != 0;
+    printf("scored on their own minute: %d; older ones scored at the song's start: %d, of which %d judged another band than their minute had (%d false hits, %d false misses)\n",
+           nt, nk, dis, flip_hit, flip_miss);
     prefs_load();
     int sk = 0, rp = 0;
     for (int i = 0; i < npref; i++) { sk += prefs[i].skips; rp += prefs[i].replays; }
@@ -1100,7 +1148,7 @@ int main(int argc, char **argv) {
             for (char *s = strtok(line, "\t\n"); s && nf < 40; s = strtok(NULL, "\t\n")) fld[nf++] = s;
             if (nf >= 28 && !strcmp(fld[0], "Q")) {
                 for (int b = 0; b < NBANDS; b++) last_pf[b] = atof(fld[22 + b]);
-                last_pred_at = atol(fld[1]) + (long) (atof(fld[3]) * 60); last_pred = 1; last_pred_jev = !strcmp(fld[6], "jev");
+                last_pred_at = nf >= 32 ? atol(fld[31]) : atol(fld[1]) + (long) (atof(fld[3]) * 60); last_pred = 1; last_pred_jev = !strcmp(fld[6], "jev");
             }
         }
         if (q) fclose(q);
@@ -1155,6 +1203,9 @@ int main(int argc, char **argv) {
             int a = fetch();
             last_fetch = now;
             if (a >= 0) { last_ok = now; say("feed%s: %d new minutes, latest netvar %.4f, %ld s old", song_changed ? " (song change)" : "", a, sval[sn - 1], (long) (now - sep[sn - 1])); }
+            /* New minutes resolve the forecasts made for them: scored, and
+             * the blend refitted. */
+            if (a > 0) { dots_sync(); int before = rn; load_resolved(); if (rn != before) refit(); }
             else say("feed: no answer (keeping the series as it is)");
         }
         double dot = dot_now();
@@ -1263,6 +1314,11 @@ int main(int argc, char **argv) {
             if (!queued_id[0] && md.trackid[0] && strcmp(st, "Stopped") != 0 && sn >= 240) {
                 double left = md.length > 0 ? (double) (md.length - vlc_position()) / 60e6 : 4;
                 if (left < 0) left = 0;
+                /* The forecast is for one GCP minute: the newest now plus the
+                 * song's time left (whole minutes), the same for Jev, the
+                 * analogs and the score. */
+                int hmin = (int) (left + 0.5); if (hmin < 1) hmin = 1;
+                long target = sep[sn - 1] + (long) hmin * 60;
                 double probs[NBANDS] = { 0 };
                 /* Jev answers 25 s before the song ends at the latest (about
                  * 40 s on the 35B with CLAUDE.md; longer while the machine
@@ -1271,7 +1327,7 @@ int main(int argc, char **argv) {
                 int deadline = (int) (left * 60) - 25;
                 if (deadline > 300) deadline = 300;
                 if (use_jev && deadline >= 10) busy("asking Jev");
-                int from_jev = use_jev && deadline >= 10 && ask_jev(left, deadline, probs) == 0;
+                int from_jev = use_jev && deadline >= 10 && ask_jev((double) hmin, deadline, probs) == 0;
                 unbusy();
                 if (use_jev && !from_jev) say("Jev %s: queued on the dot's band now", deadline >= 10 ? "did not answer in time" : "not asked (the song ends too soon)");
                 if (!from_jev) { for (int b = 0; b < NBANDS; b++) probs[b] = 0; probs[band] = 1; }
@@ -1279,7 +1335,6 @@ int main(int argc, char **argv) {
                  * blend of the two with the exponents refitted on every
                  * resolved forecast; the band is drawn from the blend. */
                 dots_sync();
-                int hmin = (int) (left + 0.5); if (hmin < 1) hmin = 1;
                 double pa[NBANDS], pf[NBANDS];
                 double neff = anchored(sn - 1, hmin, pa);
                 int has_a = neff >= 3;
@@ -1299,14 +1354,14 @@ int main(int argc, char **argv) {
                         snprintf(queued_id, sizeof queued_id, "%s", id);
                         snprintf(queued_uri, sizeof queued_uri, "%s", u);
                         queued_band = nb;
-                        memcpy(last_pf, pf, sizeof last_pf); last_pred_at = (long) now + (long) (left * 60); last_pred = 1; last_pred_jev = from_jev;
+                        memcpy(last_pf, pf, sizeof last_pf); last_pred_at = target; last_pred = 1; last_pred_jev = from_jev;
                         FILE *q = fopen(qp, "w");
                         if (q) { fprintf(q, "%s\t%s\t%d\n", id, u, nb); fclose(q); }
                         logline("Q\t%ld\t%s\t%.1f\t%.4f\t%s\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%s\t%s\t%ld"
-                                "\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.2f\t%.2f\t%.1f\n", (long) now, id, left, dot,
+                                "\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.2f\t%.2f\t%.1f\t%ld\n", (long) now, id, left, dot,
                                 band_name[band], from_jev ? "jev" : "dot", probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], band_name[nb], t,
                                 sn ? (long) (now - sep[sn - 1]) : -1L,
-                                pa[0], pa[1], pa[2], pa[3], pa[4], pa[5], pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], blend_a, blend_c, neff);
+                                pa[0], pa[1], pa[2], pa[3], pa[4], pa[5], pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], blend_a, blend_c, neff, target);
                         say("queued at the bottom (%s plays, %.1f min left): band %s; Jev%s [%.2f %.2f %.2f %.2f %.2f %.2f], analog (%.0f) [%.2f %.2f %.2f %.2f %.2f %.2f], "
                             "blend ^%.2f ^%.2f [%.2f %.2f %.2f %.2f %.2f %.2f] %s", md.trackid, left, band_name[nb], from_jev ? "" : " (none)",
                             probs[0], probs[1], probs[2], probs[3], probs[4], probs[5], neff, pa[0], pa[1], pa[2], pa[3], pa[4], pa[5],

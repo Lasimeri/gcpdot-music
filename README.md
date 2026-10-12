@@ -23,6 +23,10 @@ Intel Phi Jev forecasting where it is going.
   then a song from that band's folders, appended at the end of the VLC playlist, after the last song queued (MPRIS
   `TrackList.AddTrack`), one ahead at a time; a restart takes over the song it queued. The song playing is
   never cut (`switch=next`; `switch=now` cuts on a band change).
+- **The timing:** each forecast is for one GCP minute, the newest when it is made plus the song's time
+  left (whole minutes; the same horizon for Jev and the analogs), logged as the `Q` line's last field, and
+  is scored on that minute's live dot once the minute arrives, not on whatever minute is newest when the
+  song starts (its lag differs: on 96 older forecasts that judged another band 4 times, 3 false hits).
 - **The record:** `~/.local/state/gcpdot-music/predictions.tsv`: a `Q` line per queued song (time, playlist
   id, minutes ahead, dot, band then, source, the six probabilities, band drawn, file) and an `S` line when it
   starts (dot and band at the start), so the forecast can be scored against persistence. The last field
