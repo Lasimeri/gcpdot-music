@@ -140,7 +140,7 @@ not counted. `gcpdot-music score` prints the totals.
 
 ## The display
 
-`gcpdot-show [OUTPUT]` opens `gcpdot-music show` in a small Alacritty window (52 x 24; Konsole when there
+`gcpdot-show [OUTPUT]` opens `gcpdot-music show` in a small Alacritty window (52 x 32; Konsole when there
 is no Alacritty) and moves it to the bottom-right corner of OUTPUT (default DP-2) with a one-shot KWin
 script. It shows the live GCP 2.0 dot and its forecast for the next song (the same live dot), in the old
 gcpdot's colours, the forecast per band,
@@ -169,3 +169,7 @@ once is not reached on this data: when the dot sits on a band edge the next minu
 decides it. GCP publishes each minute 2.5 to 4 minutes late, so 5 minutes past the newest minute is
 about 1 to 2.5 minutes ahead of the clock. The display's alert line uses a 2-minute forecast made on
 every new minute (the feed is read every 2 min) and alerts at P >= 0.6.
+
+The window's band-change log (last 24 h of the 2-minute alerts): **hits** are band changes an alert
+caught (P(change) >= 0.6, naming the right band), **misses** are changes without such an alert,
+**false alarms** are alerts whose change did not come; below them the latest five events, newest first.

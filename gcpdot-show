@@ -1,6 +1,6 @@
 #!/bin/sh
 # gcpdot-show: the GCP dot display (gcpdot-music show) in a small terminal
-# window (Alacritty, 52 x 24, else Konsole), moved to the bottom-right
+# window (Alacritty, 52 x 32, else Konsole), moved to the bottom-right
 # corner of an output (default DP-2, the left monitor) by a one-shot KWin
 # script once its title reads "GCP dot".
 #   gcpdot-show [OUTPUT]
@@ -8,12 +8,12 @@ out=${1:-DP-2}
 w=0 h=0
 if ! ps -eo args | grep -q '^[^ ]*gcpdot-music show$'; then
     if command -v alacritty > /dev/null; then
-        setsid alacritty --title "GCP dot" --class gcpdot -o window.dimensions.columns=52 -o window.dimensions.lines=24 \
+        setsid alacritty --title "GCP dot" --class gcpdot -o window.dimensions.columns=52 -o window.dimensions.lines=32 \
             -o 'colors.primary.background="#0a0a0f"' -e gcpdot-music show > /dev/null 2>&1 < /dev/null &
     else
         setsid konsole --separate --hide-menubar --hide-tabbar -p LocalTabTitleFormat=%w -p RemoteTabTitleFormat=%w \
             -e gcpdot-music show > /dev/null 2>&1 < /dev/null &
-        w=520 h=560   # Konsole opens at its last window size: set one
+        w=520 h=740   # Konsole opens at its last window size: set one
     fi
 fi
 js=$(mktemp --suffix=.js)

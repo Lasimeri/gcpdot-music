@@ -954,6 +954,13 @@ static double alert_p[NBANDS]; static long alert_at; static int alert_ok;
  * alert (P(change) >= 0.6, the right band), alerts right, log loss. */
 struct live { int n, ok, ch, caught, calls, callok; double ll; };
 static struct live live24;
+/* The latest band-change events for the display's log: a change that
+ * happened (caught or missed) or an alert that was raised (a false alarm
+ * when no change came): target minute, band then, band at the target,
+ * whether an alert was raised, the band it named, its probability. */
+struct cev { long target; int nb, act, call, ob; double pc; };
+#define NCEV 5
+static struct cev cev[NCEV]; static int ncev;
 static int minute_index(long e);
 static void alert_log(long made, long target, int now_b, const double p[NBANDS]) {
     char p2[700]; snprintf(p2, sizeof p2, "%s/alerts.tsv", statedir);
@@ -966,7 +973,7 @@ static void alert_log(long made, long target, int now_b, const double p[NBANDS])
 }
 static void alert_score(void) {
     char p2[700]; snprintf(p2, sizeof p2, "%s/alerts.tsv", statedir);
-    memset(&live24, 0, sizeof live24);
+    memset(&live24, 0, sizeof live24); ncev = 0;
     FILE *f = fopen(p2, "r");
     if (!f || !sn) { if (f) fclose(f); return; }
     long newest = sep[sn - 1], made, target; int nb; double p[NBANDS];
@@ -981,6 +988,10 @@ static void alert_score(void) {
         live24.n++; live24.ok += top == act; live24.ll -= log(p[act] > 1e-6 ? p[act] : 1e-6);
         if (act != nb) { live24.ch++; live24.caught += call && ob == act; }
         if (call) { live24.calls++; live24.callok += ob == act; }
+        if (act != nb || call) {   /* newest last; the oldest dropped */
+            if (ncev == NCEV) { memmove(cev, cev + 1, (NCEV - 1) * sizeof *cev); ncev--; }
+            cev[ncev++] = (struct cev) { target, nb, act, call, ob, 1 - p[nb] };
+        }
     }
     fclose(f);
 }
@@ -995,6 +1006,7 @@ static void write_dots(double gcp, double ref, const double pf[NBANDS], int have
         fprintf(f, "\n");
     }
     if (live24.n) fprintf(f, "live=%d %d %d %d %d %d %.4f\n", live24.n, live24.ok, live24.ch, live24.caught, live24.calls, live24.callok, live24.ll / live24.n);
+    for (int i = 0; i < ncev; i++) fprintf(f, "event=%ld %d %d %d %d %.3f\n", cev[i].target, cev[i].nb, cev[i].act, cev[i].call, cev[i].ob, cev[i].pc);
     if (alert_ok) {
         fprintf(f, "alert_at=%ld\nalert=", alert_at);
         for (int b = 0; b < NBANDS; b++) fprintf(f, "%s%.4f", b ? " " : "", alert_p[b]);
@@ -1032,6 +1044,7 @@ static int cmd_show(void) {
         double gcp = -1, ref = -1, pred[NBANDS] = { 0 }; long t = 0, latest = 0, pred_at = 0; int havep = 0;
         char src[32] = "", lastp[16] = "", lasta[16] = ""; long last_tgt = 0, alert_at2 = 0; double al[NBANDS] = { 0 }; int haveal = 0;
         int ln = 0, lok = 0, lch = 0, lcaught = 0, lcalls = 0, lcallok = 0; double lll = 0;
+        struct cev ev[NCEV]; int nev = 0;
         FILE *f = fopen(p, "r");
         if (f) {
             char line[256];
@@ -1042,6 +1055,7 @@ static int cmd_show(void) {
                 if (sscanf(line, "last_target=%ld", &last_tgt) == 1 || sscanf(line, "last_pred=%15s", lastp) == 1 || sscanf(line, "last_actual=%15s", lasta) == 1) continue;
                 if (sscanf(line, "alert_at=%ld", &alert_at2) == 1) continue;
                 if (sscanf(line, "live=%d %d %d %d %d %d %lf", &ln, &lok, &lch, &lcaught, &lcalls, &lcallok, &lll) == 7) continue;
+                if (nev < NCEV && sscanf(line, "event=%ld %d %d %d %d %lf", &ev[nev].target, &ev[nev].nb, &ev[nev].act, &ev[nev].call, &ev[nev].ob, &ev[nev].pc) == 6) { if (ev[nev].nb >= 0 && ev[nev].nb < NBANDS && ev[nev].act >= 0 && ev[nev].act < NBANDS && ev[nev].ob >= 0 && ev[nev].ob < NBANDS) nev++; continue; }
                 if (!strncmp(line, "alert=", 6)) { haveal = sscanf(line + 6, "%lf %lf %lf %lf %lf %lf", &al[0], &al[1], &al[2], &al[3], &al[4], &al[5]) == 6; continue; }
                 if (!strncmp(line, "pred=", 5)) havep = sscanf(line + 5, "%lf %lf %lf %lf %lf %lf", &pred[0], &pred[1], &pred[2], &pred[3], &pred[4], &pred[5]) == 6;
             }
@@ -1106,6 +1120,25 @@ static int cmd_show(void) {
         /* the alert's live record, last 24 h */
         if (ln) printf("\033[22;3H\033[38;2;138;106;62mlive 24h %d%% right, changes %d/%d, alerts %d/%d", 100 * lok / ln, lcaught, lch, lcallok, lcalls);
         else printf("\033[22;3H\033[38;2;100;100;100mlive record: waiting for scored alerts");
+        /* The band-change log: hits and misses over the band changes of the
+         * last 24 h, false alarms over the alerts, then the latest events
+         * (newest first): caught (green), missed (red), false alarm (amber). */
+        printf("\033[24;3H\033[38;2;196;148;90mband changes, last 24 h");
+        if (lch) printf("\033[25;3H\033[38;2;100;250;100mhits %d%%\033[38;2;150;150;150m (%d/%d)  \033[38;2;255;80;80mmisses %d%%\033[38;2;150;150;150m (%d/%d)",
+                        100 * lcaught / lch, lcaught, lch, 100 * (lch - lcaught) / lch, lch - lcaught, lch);
+        else printf("\033[25;3H\033[38;2;100;100;100mno band change scored yet");
+        if (lcalls) printf("\033[26;3H\033[38;2;255;190;60mfalse alarms %d%%\033[38;2;150;150;150m (%d of %d alerts)", 100 * (lcalls - lcallok) / lcalls, lcalls - lcallok, lcalls);
+        else printf("\033[26;3H\033[38;2;100;100;100mno alert raised yet");
+        for (int i = 0; i < nev; i++) {
+            const struct cev *e = &ev[nev - 1 - i];
+            time_t et = e->target; char em[8]; strftime(em, sizeof em, "%H:%M", localtime(&et));
+            int changed = e->act != e->nb, hit = changed && e->call && e->ob == e->act;
+            const char *what = hit ? "caught" : changed ? "missed" : "false alarm";
+            unsigned c = hit ? 0x64FA64 : changed ? 0xFF5050 : 0xFFBE3C;
+            printf("\033[%d;3H\033[38;2;150;150;150m%s %s->%s \033[38;2;%u;%u;%um%s\033[38;2;150;150;150m (alert %.0f%%%s%s)", 27 + i, em,
+                   band_name[e->nb], changed ? band_name[e->act] : band_name[e->ob], c >> 16, (c >> 8) & 255, c & 255, what, 100 * e->pc,
+                   e->call && changed && !hit ? ", named " : "", e->call && changed && !hit ? band_name[e->ob] : "");
+        }
         printf("\033[0m");
         fflush(stdout);
         for (int i = 0; i < 20 && !stop; i++) usleep(100000);
