@@ -67,3 +67,13 @@ a few minutes ahead (the time left on the playing song):
 gcpdot-music score          # every resolved forecast: top band right and log loss per forecaster
 gcpdot-music backtest 4     # the analog models on the stored series, 4 minutes ahead
 ```
+
+## Skips and replays
+
+Every poll (5 s) reads VLC's position. A **skip** is a song change with more than 15 s of the last song
+left (its position carried on by the time since it was read, since a Jev question can hold the loop
+about 40 s); a **replay** is the position jumping back over 10 s within a song, or a song played within
+the last 50 starting again. Each is logged (`K` and `R` lines in predictions.tsv) and counted per song in
+`prefs.tsv`; within a band, a song's weight in the draw is exp(0.6 x replays - 0.8 x skips), at least
+0.05, so skipped songs come back less and replayed ones more. The daemon's own cuts (`switch=now`) are
+not counted. `gcpdot-music score` prints the totals.

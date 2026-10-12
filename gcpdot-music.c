@@ -173,22 +173,71 @@ static void scan_tracks(void) {
 /* The last songs played per band, not drawn again (half the band, at most 40). */
 #define RECENT 40
 static char *recent[NBANDS][RECENT]; static int recent_n[NBANDS];
+/* Skips and replays per song (prefs.tsv: URL, skips, replays), counted by
+ * the main loop from what VLC plays; a song's weight in the draw is
+ * exp(0.6 * replays - 0.8 * skips), never under 0.05. */
+struct pref { char *url; int skips, replays; };
+static struct pref *prefs; static int npref, cpref;
+static char *uri_of(const char *path);
+static struct pref *pref_get(const char *url, int make) {
+    for (int i = 0; i < npref; i++) if (!strcmp(prefs[i].url, url)) return &prefs[i];
+    if (!make) return NULL;
+    if (npref == cpref) { cpref = cpref ? cpref * 2 : 256; prefs = realloc(prefs, cpref * sizeof *prefs); }
+    prefs[npref] = (struct pref) { strdup(url), 0, 0 };
+    return &prefs[npref++];
+}
+static void prefs_path(char *p, size_t n) { snprintf(p, n, "%s/prefs.tsv", statedir); }
+static void prefs_load(void) {
+    char p[700]; prefs_path(p, sizeof p);
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    char line[4800];
+    while (fgets(line, sizeof line, f)) {
+        char *u = strtok(line, "\t\n"), *s = strtok(NULL, "\t\n"), *r = strtok(NULL, "\t\n");
+        if (u && s && r) { struct pref *q = pref_get(u, 1); q->skips = atoi(s); q->replays = atoi(r); }
+    }
+    fclose(f);
+}
+static void prefs_save(void) {
+    char p[700], t[720]; prefs_path(p, sizeof p); snprintf(t, sizeof t, "%s.new", p);
+    FILE *f = fopen(t, "w");
+    if (!f) return;
+    for (int i = 0; i < npref; i++) fprintf(f, "%s\t%d\t%d\n", prefs[i].url, prefs[i].skips, prefs[i].replays);
+    fclose(f);
+    rename(t, p);
+}
+static double pref_weight(const char *path) {
+    char *u = uri_of(path);
+    struct pref *q = pref_get(u, 0);
+    free(u);
+    if (!q) return 1;
+    double w = exp(0.6 * q->replays - 0.8 * q->skips);
+    return w < 0.05 ? 0.05 : w;
+}
 static const char *pick_track(int b) {
     struct list *l = &tracks[b];
     if (!l->n) return NULL;
     int keep = l->n / 2 < RECENT ? l->n / 2 : RECENT;
-    for (int tries = 0; tries < 64; tries++) {
-        const char *t = l->p[rnd_below((uint64_t) l->n)];
-        int seen = 0;
-        for (int i = 0; i < recent_n[b] && i < keep; i++) if (recent[b][i] && !strcmp(recent[b][i], t)) seen = 1;
-        if (seen && tries < 63) continue;
-        free(recent[b][RECENT - 1]);
-        memmove(&recent[b][1], &recent[b][0], (RECENT - 1) * sizeof(char *));
-        recent[b][0] = strdup(t);
-        if (recent_n[b] < RECENT) recent_n[b]++;
-        return t;
-    }
-    return NULL;
+    /* Weighted draw (RDSEED) over the band's songs not among its recent
+     * ones; all of them when every one is recent. */
+    double *w = malloc(l->n * sizeof *w), tot = 0;
+    for (int pass = 0; pass < 2 && tot <= 0; pass++)
+        for (int k = 0; k < l->n; k++) {
+            int seen = 0;
+            if (!pass) for (int i = 0; i < recent_n[b] && i < keep; i++) if (recent[b][i] && !strcmp(recent[b][i], l->p[k])) { seen = 1; break; }
+            w[k] = seen ? 0 : pref_weight(l->p[k]);
+            tot += w[k];
+        }
+    double u = rnd01() * tot, acc = 0;
+    int k = l->n - 1;
+    for (int i = 0; i < l->n; i++) { acc += w[i]; if (u < acc) { k = i; break; } }
+    free(w);
+    const char *t = l->p[k];
+    free(recent[b][RECENT - 1]);
+    memmove(&recent[b][1], &recent[b][0], (RECENT - 1) * sizeof(char *));
+    recent[b][0] = strdup(t);
+    if (recent_n[b] < RECENT) recent_n[b]++;
+    return t;
 }
 
 /* ---- the GCP 2.0 feed ---- */
@@ -829,6 +878,10 @@ static int cmd_score(void) {
     }
     refit();
     printf("blend now: Jev^%.2f * analog^%.2f\n", blend_a, blend_c);
+    prefs_load();
+    int sk = 0, rp = 0;
+    for (int i = 0; i < npref; i++) { sk += prefs[i].skips; rp += prefs[i].replays; }
+    printf("skips %d and replays %d over %d songs (prefs.tsv); in the draw a song weighs exp(0.6 replays - 0.8 skips), at least 0.05\n", sk, rp, npref);
     return 0;
 }
 
@@ -885,6 +938,10 @@ int main(int argc, char **argv) {
     load_resolved();
     refit();
     say("forecasts: %d resolved so far; blend Jev^%.2f * analog^%.2f", rn, blend_a, blend_c);
+    prefs_load();
+    say("skips and replays known for %d songs", npref);
+    char prev_id[96] = "", prev_url[4096] = "", *played[50] = { 0 };
+    int64_t prev_len = 0, prev_pos = 0, prev_obs = 0; int prev_playing = 0;
     pthread_t egg;
     if (pthread_create(&egg, NULL, egg_thread, NULL)) { say("the reference egg did not start"); return 1; }
     say("reference egg: %d minutes kept, one 200-bit RDSEED trial a second from now", esn);
@@ -961,6 +1018,44 @@ int main(int argc, char **argv) {
         } else {
             long cur = id_num(md.trackid);
             if (cur > max_seen_id) max_seen_id = cur;
+            /* Skips and replays. A skip: the song changed while more than
+             * 15 s of the last one was left, its position carried on by the
+             * time since it was read (the loop can sit 40 s in a Jev
+             * question). A replay: the position jumped back over 10 s within
+             * a song, or a song played within the last 50 starts again. */
+            {
+                int64_t pos = vlc_position();
+                struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                int64_t now_us = (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+                if (prev_id[0] && !strcmp(md.trackid, prev_id)) {
+                    int64_t expect = prev_pos + (prev_playing ? now_us - prev_obs : 0);
+                    if (pos + 10000000 < expect && expect > 15000000) {
+                        struct pref *q = pref_get(md.url, 1); q->replays++; prefs_save();
+                        logline("R\t%ld\t%s\t%.0f\t%.0f\t%s\n", (long) now, md.trackid, expect / 1e6, pos / 1e6, md.url);
+                        say("replayed (back from %.0f s to %.0f s): %s", expect / 1e6, pos / 1e6, md.url);
+                    }
+                } else if (md.trackid[0]) {
+                    if (prev_id[0] && prev_len > 0) {
+                        int64_t expect = prev_pos + (prev_playing ? now_us - prev_obs : 0);
+                        if (prev_len - expect > 15000000) {
+                            struct pref *q = pref_get(prev_url, 1); q->skips++; prefs_save();
+                            logline("K\t%ld\t%s\t%.0f\t%.0f\t%s\n", (long) now, prev_id, expect / 1e6, prev_len / 1e6, prev_url);
+                            say("skipped at %.0f of %.0f s: %s", expect / 1e6, prev_len / 1e6, prev_url);
+                        }
+                    }
+                    int again = 0;
+                    for (int i = 0; i < 50; i++) if (played[i] && !strcmp(played[i], md.url)) again = 1;
+                    if (again && md.url[0]) {
+                        struct pref *q = pref_get(md.url, 1); q->replays++; prefs_save();
+                        logline("R\t%ld\t%s\t0\t0\t%s\n", (long) now, md.trackid, md.url);
+                        say("played again: %s", md.url);
+                    }
+                    free(played[49]); memmove(&played[1], &played[0], 49 * sizeof *played); played[0] = strdup(md.url);
+                }
+                snprintf(prev_id, sizeof prev_id, "%s", md.trackid);
+                snprintf(prev_url, sizeof prev_url, "%s", md.url);
+                prev_len = md.length; prev_pos = pos; prev_obs = now_us; prev_playing = !strcmp(st, "Playing");
+            }
             /* Our song started: its band at the start goes in the log. */
             if (queued_id[0] && !strcmp(md.trackid, queued_id)) {
                 logline("S\t%ld\t%s\t%.4f\t%s\t%s\n", (long) now, queued_id, dot, band_name[band], band_name[queued_band]);
@@ -997,6 +1092,7 @@ int main(int argc, char **argv) {
                     sd_bus_error_free(&e);
                     say("band %s -> %s: %s", band_name[last_band], band_name[band], t);
                     logline("N\t%ld\t%.4f\t%s\t%s\n", (long) now, dot, band_name[band], t);
+                    prev_id[0] = 0;   /* a cut of ours, not a skip of yours */
                     free(u);
                     queued_id[0] = 0;
                 }
