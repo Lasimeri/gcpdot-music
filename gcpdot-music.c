@@ -976,9 +976,12 @@ static void alert_score(void) {
     memset(&live24, 0, sizeof live24); ncev = 0;
     FILE *f = fopen(p2, "r");
     if (!f || !sn) { if (f) fclose(f); return; }
-    long newest = sep[sn - 1], made, target; int nb; double p[NBANDS];
+    long newest = sep[sn - 1], made, target, last_target = 0; int nb; double p[NBANDS];
     while (fscanf(f, "%ld %ld %d %lf %lf %lf %lf %lf %lf", &made, &target, &nb, &p[0], &p[1], &p[2], &p[3], &p[4], &p[5]) == 9) {
         if (target > newest || target < newest - 86400 || nb < 0 || nb >= NBANDS) continue;
+        /* one alert per target minute: a restart logs the current one again */
+        if (target == last_target) continue;
+        last_target = target;
         int i = minute_index(target);
         if (i < 0 || i >= gdn || gdot[i] < 0) continue;
         int act = band_of(gdot[i]), top = 0, ob = -1;
