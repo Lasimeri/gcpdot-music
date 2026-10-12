@@ -558,6 +558,18 @@ int main(int argc, char **argv) {
                 queued_id[0] = 0;
                 unlink(qp);   /* played: a restart must not take it over */
             }
+            /* A song added after ours is playing (opened from the file
+             * manager: VLC appends and plays it), so ours sits before it and
+             * would never play: taken out, and a new one appended after it.
+             * VLC numbers items in the order they are added. */
+            if (queued_id[0] && cur > id_num(queued_id)) {
+                sd_bus_error e = SD_BUS_ERROR_NULL;
+                sd_bus_call_method(bus, PLAYER, MPATH, "org.mpris.MediaPlayer2.TrackList", "RemoveTrack", &e, NULL, "o", queued_id);
+                sd_bus_error_free(&e);
+                say("%s plays, added after the queued %s: that one taken out, a new one appended", md.trackid, queued_id);
+                queued_id[0] = 0;
+                unlink(qp);
+            }
             /* Gone from the playlist (replaced or removed): queued again. */
             if (queued_id[0]) {
                 char url[4600];
