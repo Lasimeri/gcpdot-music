@@ -60,6 +60,7 @@ static const char *band_desc[NBANDS] = { "index below 0.05", "0.05 to 0.10", "0.
 #define MPATH "/org/mpris/MediaPlayer2"
 
 static char home[512], cfgdir[600], statedir[600];
+static char rng_path[700];   /* the live RNG readout, rewritten every second (XDG_RUNTIME_DIR) */
 
 static void say(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -445,6 +446,13 @@ static void *egg_thread(void *arg) {
         }
         n++; sz += z; sz2 += z * z;
         egg_last_z = z; egg_trials++;
+        /* the live RNG readout, every second: this trial and the minute so
+         * far (a small file in the runtime directory, RAM) */
+        {
+            char tp[760]; snprintf(tp, sizeof tp, "%s.tmp", rng_path);
+            FILE *rf = fopen(tp, "w");
+            if (rf) { fprintf(rf, "%ld %d %+.3f %d %.4f\n", t, trial, z, n, sz2 / n); fclose(rf); rename(tp, rng_path); }
+        }
     }
     return NULL;
 }
@@ -967,6 +975,8 @@ static void paths(void) {
     if (xs && *xs) snprintf(statedir, sizeof statedir, "%s/gcpdot-music", xs); else snprintf(statedir, sizeof statedir, "%s/.local/state/gcpdot-music", home);
     char p[700]; snprintf(p, sizeof p, "%s/.local/state", home); mkdir(p, 0755);
     mkdir(statedir, 0755);
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (rt && *rt) snprintf(rng_path, sizeof rng_path, "%s/gcpdot-music-rng", rt); else snprintf(rng_path, sizeof rng_path, "%s/rng-now", statedir);
 }
 
 static int cmd_dot(void) {
@@ -1248,7 +1258,15 @@ static int cmd_show(void) {
         printf("\033[20;3H\033[38;2;150;150;150m%s", local ? "RNG " : "this PC (reference) ");
         if (ref >= 0) { unsigned c = colour_of(ref); printf("\033[38;2;%u;%u;%um●\033[38;2;150;150;150m %.3f %s", c >> 16, (c >> 8) & 255, c & 255, ref, band_name[band_of(ref)]); }
         else printf("warming up");
-        if (local && rng_n >= 0) printf("  %d/min z2 %.2f z %+.1f", rng_n, rng_z2, rng_z);
+        /* live, from the egg thread's file (every second): this trial's
+         * sum of 200 bits and z, the minute so far: trials and mean z^2 */
+        if (local) {
+            FILE *rf = fopen(rng_path, "r"); long rt0 = 0; int tr = 0, rn0 = 0; double rz = 0, rz2 = 0;
+            if (rf && fscanf(rf, "%ld %d %lf %d %lf", &rt0, &tr, &rz, &rn0, &rz2) == 5 && time(NULL) - rt0 <= 5)
+                printf("  %d z %+.2f  %d/60 z2 %.2f", tr, rz, rn0, rz2);
+            else if (rng_n >= 0) printf("\033[38;2;255;80;80m  RNG not updating");
+            if (rf) fclose(rf);
+        }
         char ltm[8] = "-"; if (last_tgt) { time_t tt2 = last_tgt; strftime(ltm, sizeof ltm, "%H:%M", localtime(&tt2)); }
         if (lastp[0]) printf("\033[21;3Hlast %s: forecast %s, live %s %s", ltm, lastp, lasta, strcmp(lastp, lasta) ? "\033[38;2;255;80;80mmiss" : "\033[38;2;100;250;100mhit");
         /* the alert's live record, last 24 h */
@@ -1275,7 +1293,7 @@ static int cmd_show(void) {
         }
         printf("\033[0m");
         fflush(stdout);
-        for (int i = 0; i < 20 && !stop; i++) usleep(100000);
+        for (int i = 0; i < 10 && !stop; i++) usleep(100000);   /* every second: the RNG readout moves */
     }
     printf("\033[0m\033[?25h\033[?7h\033[2J\033[H");
     return 0;

@@ -162,8 +162,10 @@ rewrites every loop:
 
 - the source, the live dot and its minute's age, and the forecast dot for the song's target minute (the
   2-minute forecast when there is no song forecast or its minute has passed), in the old gcpdot's colours;
-- the change alert, the forecast per band, and the RNG line (local: the RNG readout, its dot with the
-  trials in the last minute, their mean z^2 and the last z; GCP: this PC's egg as a control);
+- the change alert, the forecast per band, and the RNG line (local: the live RNG readout, every second:
+  its dot, this trial's sum of 200 bits and z, the minute so far (trials of 60, mean z^2), from
+  `$XDG_RUNTIME_DIR/gcpdot-music-rng`, which the egg thread rewrites each second; red "RNG not
+  updating" when it is over 5 s old; GCP: this PC's egg as a control); the window redraws every second;
 - the last forecast's hit or miss, the live alert record, and the band-change log: hits and misses over
   the last 24 h's changes, false alarms over its alerts, and the latest five events, newest first.
 
