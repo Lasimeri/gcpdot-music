@@ -160,8 +160,10 @@ no Alacritty) and moves it to the bottom-right corner of OUTPUT (default DP-2) w
 script, kept above other windows. It reads `~/.local/state/gcpdot-music/dots`, which the daemon
 rewrites every loop:
 
-- the source, the live dot and its minute's age, and the forecast dot for the song's target minute (the
-  2-minute forecast when there is no song forecast or its minute has passed), in the old gcpdot's colours;
+- the source, the live dot and its minute's age, and the forecast dot in the colour of the band the next
+  song was drawn from ("next song green 94%": that band and its probability), for the song's target minute (the
+  2-minute forecast and its likeliest band when there is no song forecast or its minute has passed), in
+  the old gcpdot's colours;
 - the change alert, the forecast per band, and the RNG line (local: the live RNG readout, every second:
   its dot, this trial's sum of 200 bits and z, the minute so far (trials of 60, mean z^2), from
   `$XDG_RUNTIME_DIR/gcpdot-music-rng`, which the egg thread rewrites each second; red "RNG not

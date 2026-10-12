@@ -1121,6 +1121,7 @@ static void alert_score(void) {
     }
     fclose(f);
 }
+static int drawn_band = -1;   /* the band the queued song was drawn from (the forecast dot's colour) */
 static void write_dots(double gcp, double ref, const double pf[NBANDS], int have_pred, long pred_at, int pred_src_jev) {
     char p[700], t[720]; snprintf(p, sizeof p, "%s/dots", statedir); snprintf(t, sizeof t, "%s.new", p);
     FILE *f = fopen(t, "w");
@@ -1136,6 +1137,7 @@ static void write_dots(double gcp, double ref, const double pf[NBANDS], int have
         fprintf(f, "pred_at=%ld\npred_src=%s\npred=", pred_at, pred_src_jev ? "Jev + rebuilt dot" : "rebuilt dot");
         for (int b = 0; b < NBANDS; b++) fprintf(f, "%s%.4f", b ? " " : "", pf[b]);
         fprintf(f, "\n");
+        if (drawn_band >= 0) fprintf(f, "drawn=%d\n", drawn_band);
     }
     if (live24.n) fprintf(f, "live=%d %d %d %d %d %d %.4f\n", live24.n, live24.ok, live24.ch, live24.caught, live24.calls, live24.callok, live24.ll / live24.n);
     for (int i = 0; i < ncev; i++) fprintf(f, "event=%ld %d %d %d %d %.3f\n", cev[i].target, cev[i].nb, cev[i].act, cev[i].call, cev[i].ob, cev[i].pc);
@@ -1176,6 +1178,7 @@ static int cmd_show(void) {
         double gcp = -1, ref = -1, pred[NBANDS] = { 0 }; long t = 0, latest = 0, pred_at = 0; int havep = 0;
         char src[32] = "", lastp[16] = "", lasta[16] = ""; long last_tgt = 0, alert_at2 = 0; double al[NBANDS] = { 0 }; int haveal = 0;
         char srcmode[16] = "gcp";
+        int drawn = -1;   /* the band the queued song was drawn from */
         int rng_n = -1; double rng_z2 = 0, rng_z = 0; long rng_tot = 0;   /* the RNG readout */
         int ln = 0, lok = 0, lch = 0, lcaught = 0, lcalls = 0, lcallok = 0; double lll = 0;
         struct cev ev[NCEV]; int nev = 0;
@@ -1186,6 +1189,7 @@ static int cmd_show(void) {
                 if (sscanf(line, "time=%ld", &t) == 1 || sscanf(line, "gcp=%lf", &gcp) == 1 || sscanf(line, "latest_minute=%ld", &latest) == 1 ||
                     sscanf(line, "ref=%lf", &ref) == 1 || sscanf(line, "pred_at=%ld", &pred_at) == 1) continue;
                 if (sscanf(line, "pred_src=%31[^\n]", src) == 1) continue;
+                if (sscanf(line, "drawn=%d", &drawn) == 1) { if (drawn < 0 || drawn >= NBANDS) drawn = -1; continue; }
                 if (sscanf(line, "last_target=%ld", &last_tgt) == 1 || sscanf(line, "last_pred=%15s", lastp) == 1 || sscanf(line, "last_actual=%15s", lasta) == 1) continue;
                 if (sscanf(line, "alert_at=%ld", &alert_at2) == 1) continue;
                 if (sscanf(line, "source=%15s", srcmode) == 1) continue;
@@ -1211,15 +1215,19 @@ static int cmd_show(void) {
         }
         /* the two dots */
         /* no song forecast yet (a fresh source): the 2-minute alert forecast */
-        if ((!havep || (latest && pred_at < latest)) && haveal) { for (int b = 0; b < NBANDS; b++) pred[b] = al[b]; pred_at = alert_at2; havep = 1; snprintf(src, sizeof src, "2-minute forecast"); }
+        if ((!havep || (latest && pred_at < latest)) && haveal) { for (int b = 0; b < NBANDS; b++) pred[b] = al[b]; pred_at = alert_at2; havep = 1; snprintf(src, sizeof src, "2-minute forecast"); drawn = -1; }
         int pb = havep ? top_of(pred) : -1;
         draw_disc(3, 3, 12, gcp >= 0 ? colour_of(gcp) : 0x333333, bg);
-        draw_disc(3, 27, 12, pb >= 0 ? colour_of(band_mid[pb]) : 0x333333, bg);
+        /* the forecast dot: the band the next song was drawn from (the
+         * song follows it), else the forecast's likeliest band */
+        int db = drawn >= 0 ? drawn : pb;
+        draw_disc(3, 27, 12, db >= 0 ? colour_of(band_mid[db]) : 0x333333, bg);
         printf("\033[48;2;10;10;15m\033[38;2;220;220;220m");
         printf("\033[10;3H live %s", gcp >= 0 ? "" : "-");
         if (gcp >= 0) printf("%.3f %s", gcp, band_name[band_of(gcp)]);
         printf("\033[10;27Hforecast ");
-        if (pb >= 0) printf("%s %.0f%%", band_name[pb], 100 * pred[pb]); else printf("-");
+        if (drawn >= 0) printf("\033[10;27Hnext song %s %.0f%%", band_name[drawn], 100 * pred[drawn]);
+        else if (pb >= 0) printf("%s %.0f%%", band_name[pb], 100 * pred[pb]); else printf("-");
         { time_t lt = latest; char lm[8]; strftime(lm, sizeof lm, "%H:%M", localtime(&lt));
           printf("\033[11;3H\033[38;2;138;106;62m%s, %ld min old", latest ? lm : "-", latest ? (now - latest) / 60 : 0); }
         if (pb >= 0) {
@@ -1635,7 +1643,8 @@ int main(int argc, char **argv) {
         while (q && fgets(line, sizeof line, q)) {
             char *fld[40]; int nf = 0;
             for (char *s = strtok(line, "\t\n"); s && nf < 40; s = strtok(NULL, "\t\n")) fld[nf++] = s;
-            if (nf >= 28 && !strcmp(fld[0], "Q")) {
+            if (nf >= 28 && (!strcmp(fld[0], "Q") || !strcmp(fld[0], "P"))) {
+                for (int b = 0; b < NBANDS; b++) if (!strcmp(fld[13], band_name[b])) drawn_band = b;
                 for (int b = 0; b < NBANDS; b++) last_pf[b] = atof(fld[22 + b]);
                 last_pred_at = nf >= 32 ? atol(fld[31]) : atol(fld[1]) + (long) (atof(fld[3]) * 60); last_pred = 1; last_pred_jev = !strcmp(fld[6], "jev");
             }
@@ -1903,7 +1912,7 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (id[0]) {
-                    queued_prov = phase == 1;
+                    queued_prov = phase == 1; drawn_band = nb;
                     if (phase == 2) snprintf(final_for, sizeof final_for, "%s", md.trackid);
                     memcpy(last_pf, pf, sizeof last_pf); last_pred_at = target; last_pred = 1; last_pred_jev = from_jev;
                     /* Q: the final forecast, scored on its minute; P: the
