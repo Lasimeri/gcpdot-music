@@ -593,6 +593,17 @@ static void feedback(char *out, size_t n) {
 }
 
 /* ---- Jev ---- */
+/* S as one single-quoted shell word. */
+static void shq(const char *s, char *out, size_t n) {
+    size_t o = 0;
+    if (n < 3) { if (n) out[0] = 0; return; }
+    out[o++] = '\'';
+    for (; *s && o + 6 < n; s++) {
+        if (*s == '\'') { memcpy(out + o, "'\\''", 4); o += 4; }
+        else out[o++] = *s;
+    }
+    out[o++] = '\''; out[o] = 0;
+}
 /* DEADLINE_S: Jev must answer within it (the song playing ends soon after),
  * else the caller queues on the dot's band now. */
 static int ask_jev(double horizon_min, int deadline_s, double probs[NBANDS]) {
@@ -627,8 +638,12 @@ static int ask_jev(double horizon_min, int deadline_s, double probs[NBANDS]) {
     char choice[1024]; int c = 0;
     c += snprintf(choice + c, sizeof choice - c, "band=Which band will the gcpdot index be in %.0f minutes from now?|", horizon_min < 1 ? 1 : horizon_min);
     for (int b = 0; b < NBANDS; b++) c += snprintf(choice + c, sizeof choice - c, "%s%s:%s", b ? ";" : "", band_name[b], band_desc[b]);
-    char cmd[10000];
-    snprintf(cmd, sizeof cmd, "timeout %d '%s/.local/bin/mjev' query --state '%s' --choice '%s' 2>/dev/null", deadline_s, home, state, choice);
+    char cmd[16000];
+    /* Single-quoted for the shell, a quote inside as '\'' (the state's
+     * "machine's" broke every question for an hour without it). */
+    char qs[12000], qc[2400];
+    shq(state, qs, sizeof qs); shq(choice, qc, sizeof qc);
+    snprintf(cmd, sizeof cmd, "timeout %d '%s/.local/bin/mjev' query --state %s --choice %s 2>/dev/null", deadline_s, home, qs, qc);
     char *out = run_read(cmd, NULL);
     if (!out) return -1;
     char *p = strstr(out, "\"probabilities\"");
