@@ -116,7 +116,9 @@ a few minutes ahead (the time left on the playing song):
 - **Anchored analog** (the model in use): the band now gets the measured stay rate for that horizon, the
   rest goes to the analogs' bands. Mean log loss 0.248 against persistence's 0.301 at 2 min, 0.419 against
   0.516 at 4.
-- **Jev** gets its last 8 resolved forecasts (predicted band and probability, actual band) in its state.
+- **Jev** gets its last 8 resolved forecasts (predicted band and probability, actual band) in its state,
+  and the rebuilt-dot forecast for the same minute as a suggestion (its six band probabilities and its
+  chance of a band change).
 - **The blend** is Jev^a * anchored^c, normalized; a and c are refitted (grid 0..2) to the lowest mean log
   loss over every resolved forecast each time a song starts (defaults 0.5 and 1 under 10 resolved).
   The band is drawn from the blend with RDSEED.

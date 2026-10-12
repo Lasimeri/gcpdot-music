@@ -652,7 +652,7 @@ static void shq(const char *s, char *out, size_t n) {
 }
 /* DEADLINE_S: Jev must answer within it (the song playing ends soon after),
  * else the caller queues on the dot's band now. */
-static int ask_jev(double horizon_min, int deadline_s, double probs[NBANDS]) {
+static int ask_jev(double horizon_min, int deadline_s, const double *suggest, double probs[NBANDS]) {
     if (sn < 120) return -1;
     char state[8192]; int o = 0;
     o += snprintf(state + o, sizeof state - o, "GCP 2.0 global network variance (netvar), the mean of each 10 minutes over the last two hours, oldest first:");
@@ -678,9 +678,18 @@ static int ask_jev(double horizon_min, int deadline_s, double probs[NBANDS]) {
         }
         o += snprintf(state + o, sizeof state - o, ". Reference now: %.2f (%s).", rnow, band_name[band_of(rnow)]);
     }
+    /* The rebuilt-dot model's forecast for the same minute, as a suggestion
+     * (the dot recomputed from the known minutes and a forecast of the next
+     * ones; exact when that forecast is), with its chance of a band change. */
+    if (suggest) {
+        int nb = band_of(dot_now());
+        o += snprintf(state + o, sizeof state - o, " Suggestion from the rebuilt-dot model (the index recomputed from the known minutes and a forecast of the next ones, ranked exactly as the live index; in a backtest 98 percent right 2 minutes ahead and 88 percent of band changes caught) for the same minute:");
+        for (int b = 0; b < NBANDS; b++) o += snprintf(state + o, sizeof state - o, "%s %s %.2f", b ? "," : "", band_name[b], suggest[b]);
+        o += snprintf(state + o, sizeof state - o, "; chance of a change from the band now (%s): %.0f percent.", band_name[nb], 100 * (1 - suggest[nb]));
+    }
     /* Its own recent record, so a miss can move the next forecast. */
     char fb[1500]; feedback(fb, sizeof fb);
-    if (fb[0]) o += snprintf(state + o, sizeof state - o, " Your recent forecasts of this (your top band and its probability, then the band when that song started):%s.", fb);
+    if (fb[0]) o += snprintf(state + o, sizeof state - o, " Your recent forecasts of this (your top band and its probability, then the band the live index was in at that minute):%s.", fb);
     char choice[1024]; int c = 0;
     c += snprintf(choice + c, sizeof choice - c, "band=Which band will the gcpdot index be in %.0f minutes from now?|", horizon_min < 1 ? 1 : horizon_min);
     for (int b = 0; b < NBANDS; b++) c += snprintf(choice + c, sizeof choice - c, "%s%s:%s", b ? ";" : "", band_name[b], band_desc[b]);
@@ -1490,6 +1499,16 @@ int main(int argc, char **argv) {
                 int hmin = (int) (left + 0.5); if (hmin < 1) hmin = 1;
                 long target = sep[sn - 1] + (long) hmin * 60;
                 double probs[NBANDS] = { 0 };
+                /* The mechanistic forecast first: the dot rebuilt from the
+                 * known minutes and an AR(2) netvar forecast, ranked as the
+                 * live dot is (oracle check 100%; backtest at 2 min 98%
+                 * right, band changes caught 88%, log loss 0.062). It goes
+                 * to Jev as a suggestion and into the blend. */
+                dots_sync();
+                double pa[NBANDS], pf[NBANDS];
+                psum_sync();
+                double neff = mech_forecast(2, sn - 1, hmin, pa) >= 0 ? 100 : 0;
+                int has_a = neff >= 3;
                 /* Jev answers 25 s before the song ends at the latest (about
                  * 40 s on the 35B with CLAUDE.md; longer while the machine
                  * trains or the subject loads), at most 300 s; under 35 s
@@ -1497,22 +1516,12 @@ int main(int argc, char **argv) {
                 int deadline = (int) (left * 60) - 25;
                 if (deadline > 300) deadline = 300;
                 if (use_jev && deadline >= 10) busy("asking Jev");
-                int from_jev = use_jev && deadline >= 10 && ask_jev((double) hmin, deadline, probs) == 0;
+                int from_jev = use_jev && deadline >= 10 && ask_jev((double) hmin, deadline, has_a ? pa : NULL, probs) == 0;
                 unbusy();
                 if (use_jev && !from_jev) say("Jev %s: queued on the dot's band now", deadline >= 10 ? "did not answer in time" : "not asked (the song ends too soon)");
                 if (!from_jev) { for (int b = 0; b < NBANDS; b++) probs[b] = 0; probs[band] = 1; }
-                /* The analog forecast from the dot's own history, and the
-                 * blend of the two with the exponents refitted on every
-                 * resolved forecast; the band is drawn from the blend. */
-                dots_sync();
-                double pa[NBANDS], pf[NBANDS];
-                /* the mechanistic forecast: the dot rebuilt from the known
-                 * minutes and an AR(2) netvar forecast, ranked as the live
-                 * dot is (oracle check 100%); backtest at 2 min: 98% right,
-                 * band changes caught 88%, log loss 0.062 */
-                psum_sync();
-                double neff = mech_forecast(2, sn - 1, hmin, pa) >= 0 ? 100 : 0;
-                int has_a = neff >= 3;
+                /* the blend of the two, exponents refitted on every resolved
+                 * forecast; the band is drawn from the blend */
                 if (from_jev || has_a) pool(probs, from_jev, pa, has_a, blend_a, blend_c, pf);
                 else for (int b = 0; b < NBANDS; b++) pf[b] = probs[b];
                 if (!has_a) for (int b = 0; b < NBANDS; b++) pa[b] = 0;
