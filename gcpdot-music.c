@@ -1,32 +1,31 @@
-/* gcpdot-music: the next song chosen by where the old GCP dot would be.
+/* gcpdot-music: the next song chosen by where the GCP dot will be.
  *
  * The dot (global-mind.org/gcpdot, gcpdot.com, defunct) showed an index:
  * the probability of the Global Consciousness Project's network variance
  * over the last one and two hours, the more coherent of the two; above
  * 0.95 blue (small variance), 0.90-0.95 teal, 0.40-0.90 green, 0.10-0.40
- * yellow, 0.05-0.10 orange, below 0.05 red (large variance). GCP 1.0 ended
- * on 3 April 2026; GCP 2.0 (gcp2.net) publishes its network variance once a
- * minute. That series is already smoothed (one minute to the next
- * correlates 0.964), so it is not a chi-square and the index is taken
- * empirically: the share of past windows (1 h, 2 h; up to 7 days of minutes
- * kept on disk) whose mean is at least the latest window's; of the 1 h and
- * 2 h indexes the one farther from 0.5 is shown.
+ * yellow, 0.05-0.10 orange, below 0.05 red (large variance).
+ *
+ * Two sources (bands.conf source=): local, this PC's RDSEED as one egg (a
+ * 200-bit trial a second; the 1 h / 2 h summed z^2 against chi-square, the
+ * original dot's math, exact); gcp, GCP 2.0's minute netvar from gcp2.net
+ * (2.5 to 4 minutes late, rate limited, already smoothed, so ranked
+ * empirically against past windows).
  *
  * Each band plays a group of folders (~/.config/gcpdot-music/bands.conf).
- * When a song starts, the next one is queued in VLC right after it (MPRIS
- * TrackList.AddTrack): Intel Phi Jev (mjev query) is asked which band the
- * dot will be in when the current song ends, given the last two hours; the
- * band is drawn from Jev's probabilities with the CPU's hardware random
- * source (RDSEED), and the song from the band's folders the same way. With
- * Jev off or failing, the band is the dot's band now. Every queue and every
- * start is logged (~/.local/state/gcpdot-music/predictions.tsv) so Jev's
- * forecast can be scored against the band at the start and against
- * persistence (the band at the moment of asking).
+ * When a song starts, a provisional next song is queued at the bottom of
+ * VLC's playlist (MPRIS TrackList.AddTrack) from a forecast for the minute
+ * the song ends; DECIDE_S before the end the forecast is made again (with
+ * Intel Phi Jev, mjev query, in a refitted blend) and the band drawn again
+ * with RDSEED, replacing the provisional song if the band differs. Every
+ * forecast is logged (~/.local/state/gcpdot-music/predictions[-local].tsv)
+ * and scored on its target minute; a 2-minute alert is made and scored on
+ * every new minute; `gcpdot-music show` draws it all (gcpdot-show).
  *
  *   gcpdot-music            run (the user service gcpdot-music.service)
- *   gcpdot-music dot        the dot now, and the share of the last 24 h
- *                           each band would have held (a check)
- *   gcpdot-music status     what the running daemon last wrote
+ *   gcpdot-music start      start the playlist from the dot's band now
+ *   gcpdot-music show       the display (dots file, every second)
+ *   gcpdot-music dot | score | mech H [METHOD] | backtest H | compare | status
  */
 #define _GNU_SOURCE
 #include <ctype.h>
@@ -142,11 +141,6 @@ static uint64_t rdseed64(void) {
     exit(1);
 }
 static double rnd01(void) { return (double) (rdseed64() >> 11) * (1.0 / 9007199254740992.0); }
-static uint64_t rnd_below(uint64_t n) {   /* unbiased: rejection */
-    uint64_t lim = UINT64_MAX - UINT64_MAX % n, v;
-    do v = rdseed64(); while (v >= lim);
-    return v % n;
-}
 
 /* ---- tracks ---- */
 struct list { char **p; int n, cap; };
@@ -170,7 +164,7 @@ static int scan_cb(const char *p, const struct stat *st, int type, struct FTW *f
 static void scan_tracks(void) {
     for (int b = 0; b < NBANDS; b++) {
         tracks[b].n = 0;
-        char dirs[2048]; snprintf(dirs, sizeof dirs, "%s", band_dirs[b]);
+        char dirs[2048]; memcpy(dirs, band_dirs[b], sizeof dirs);
         for (char *s = strtok(dirs, ","); s; s = strtok(NULL, ",")) {
             while (*s == ' ') s++;
             char d[2200]; snprintf(d, sizeof d, "%s/%s", root, s);
@@ -741,7 +735,7 @@ static void refit(void) {
         if (loss < best) { best = loss; ba = a; bc = c; }
     }
     blend_a = ba; blend_c = bc;
-    say("blend refitted on %d resolved forecasts: Jev^%.2f * analog^%.2f, mean log loss %.3f", n, ba, bc, best / n);
+    say("blend refitted on %d resolved forecasts: Jev^%.2f * forecast^%.2f, mean log loss %.3f", n, ba, bc, best / n);
 }
 /* Jev's recent record, for its state: its top band and probability, and
  * the band at the song's start. */
@@ -779,7 +773,7 @@ static int ask_jev(double horizon_min, int deadline_s, const double *suggest, do
         double s = 0; for (int i = sn - 120 + k * 10; i < sn - 120 + (k + 1) * 10; i++) s += sval[i];
         o += snprintf(state + o, sizeof state - o, src_local ? "%s %.3f" : "%s %.1f", k ? "," : "", s / 10);
     }
-    o += snprintf(state + o, sizeof state - o, ". The gcpdot index (the share of past windows with a mean network variance at least as high; low = unusually high variance) every 10 minutes over the same two hours:");
+    o += snprintf(state + o, sizeof state - o, src_local ? ". The gcpdot index (the exact chi-square upper-tail probability of the summed z squared over the last 1 h and 2 h, the one farther from 0.5; low = unusually high variance) every 10 minutes over the same two hours:" : ". The gcpdot index (the share of past windows with a mean network variance at least as high; low = unusually high variance) every 10 minutes over the same two hours:");
     for (int k = 0; k < 12; k++) {
         double x = dot_at(sn - 110 + k * 10, 0);
         o += snprintf(state + o, sizeof state - o, "%s %.2f", k ? "," : "", x);
@@ -802,7 +796,8 @@ static int ask_jev(double horizon_min, int deadline_s, const double *suggest, do
      * ones; exact when that forecast is), with its chance of a band change. */
     if (suggest) {
         int nb = band_of(dot_now());
-        o += snprintf(state + o, sizeof state - o, " Suggestion from the rebuilt-dot model (the index recomputed from the known minutes and a forecast of the next ones, ranked exactly as the live index; in a backtest 98 percent right 2 minutes ahead and 88 percent of band changes caught) for the same minute:");
+        if (src_local) o += snprintf(state + o, sizeof state - o, " Suggestion from the exact model (the known trials plus the future ones, whose summed z squared is chi-square; calibrated: in a backtest 85.6 percent right 1 minute ahead, 83.0 at 2, 72.8 at 5) for the same minute:");
+        else o += snprintf(state + o, sizeof state - o, " Suggestion from the rebuilt-dot model (the index recomputed from the known minutes and a forecast of the next ones, ranked exactly as the live index; in a backtest 98 percent right 2 minutes ahead and 88 percent of band changes caught) for the same minute:");
         for (int b = 0; b < NBANDS; b++) o += snprintf(state + o, sizeof state - o, "%s %s %.2f", b ? "," : "", band_name[b], suggest[b]);
         o += snprintf(state + o, sizeof state - o, "; chance of a change from the band now (%s): %.0f percent.", band_name[nb], 100 * (1 - suggest[nb]));
     }
@@ -1174,6 +1169,9 @@ static int cmd_show(void) {
     printf("\033]0;GCP dot\007\033[?25l\033[?7l");   /* the window title (gcpdot-show finds the window by it), cursor off, no line wrap: an overlong line is cut, it never scrolls the display */
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     const unsigned bg = 0x0A0A0F;
+    /* each frame written whole (full buffering, one flush) inside a
+     * synchronized update, so the redraw every second does not flicker */
+    static char obuf[1 << 16]; setvbuf(stdout, obuf, _IOFBF, sizeof obuf);
     while (!stop) {
         double gcp = -1, ref = -1, pred[NBANDS] = { 0 }; long t = 0, latest = 0, pred_at = 0; int havep = 0;
         char src[32] = "", lastp[16] = "", lasta[16] = ""; long last_tgt = 0, alert_at2 = 0; double al[NBANDS] = { 0 }; int haveal = 0;
@@ -1203,7 +1201,7 @@ static int cmd_show(void) {
         }
         long now = time(NULL);
         int local = !strcmp(srcmode, "local");
-        printf("\033[48;2;10;10;15m\033[2J\033[H\033[38;2;196;148;90m %s\033[0m", local ? "this PC's RNG dot and its forecast" : "GCP 2.0 live dot and its forecast");
+        printf("\033[?2026h\033[48;2;10;10;15m\033[2J\033[H\033[38;2;196;148;90m %s\033[0m", local ? "this PC's RNG dot and its forecast" : "GCP 2.0 live dot and its forecast");
         /* Stale: busy on a long wait (the busy note says which), or, five
          * minutes on without a note, not writing at all. */
         if (!f || now - t > 30) {
@@ -1299,7 +1297,7 @@ static int cmd_show(void) {
                    band_name[e->nb], changed ? band_name[e->act] : band_name[e->ob], c >> 16, (c >> 8) & 255, c & 255, what, 100 * e->pc,
                    e->call && changed && !hit ? ", named " : "", e->call && changed && !hit ? band_name[e->ob] : "");
         }
-        printf("\033[0m");
+        printf("\033[0m\033[?2026l");
         fflush(stdout);
         for (int i = 0; i < 10 && !stop; i++) usleep(100000);   /* every second: the RNG readout moves */
     }
@@ -1310,7 +1308,7 @@ static int cmd_show(void) {
 static int cmd_score(void) {
     series_open(); dots_sync(); load_resolved();
     if (!rn) { printf("no resolved forecasts yet (%s/predictions.tsv)\n", statedir); return 1; }
-    struct { const char *name; int n, ok, xn, xok; double ll; } m[4] = { { "persistence" }, { "Jev" }, { "analog" }, { "blend" } };
+    struct { const char *name; int n, ok, xn, xok; double ll; } m[4] = { { "persistence", 0, 0, 0, 0, 0 }, { "Jev", 0, 0, 0, 0, 0 }, { "forecast", 0, 0, 0, 0, 0 }, { "blend", 0, 0, 0, 0, 0 } };
     for (int i = 0; i < rn; i++) {
         struct res *r = &rs[i];
         int cross = r->now_b != r->act;
@@ -1326,7 +1324,7 @@ static int cmd_score(void) {
         printf("%-12s %6d %9.1f%% %9s %8d/%d right\n", m[k].name, m[k].n, 100.0 * m[k].ok / m[k].n, ll, m[k].xok, m[k].xn);
     }
     refit();
-    printf("blend now: Jev^%.2f * analog^%.2f\n", blend_a, blend_c);
+    printf("blend now: Jev^%.2f * forecast^%.2f\n", blend_a, blend_c);
     /* How often scoring at the song's start judged another minute than the
      * one forecast (older lines; newer ones are scored on their minute). */
     int nk = 0, dis = 0, flip_hit = 0, flip_miss = 0;
@@ -1369,13 +1367,6 @@ static void psum_sync(void) {
     psum = realloc(psum, (sn + 1) * sizeof *psum);
     psum[0] = 0; for (int i = 0; i < sn; i++) psum[i + 1] = psum[i] + sval[i];
     psn = sn + 1;
-}
-/* The share of W-minute windows ending before minute END (exclusive) whose
- * sum is at least CUR: the live dot's ranking, with the window given. */
-static double rank_sum(int w, int end, double cur) {
-    int tot = 0, ge = 0;
-    for (int i = 0; i + w <= end; i++) { tot++; if (psum[i + w] - psum[i] >= cur - 1e-9) ge++; }
-    return tot ? (double) ge / tot : -1;
 }
 /* Netvar forecasts for the H minutes after minute T (index, inclusive):
  * 0 last value held, 1 the 5-minute trend carried on, 2 AR(2) on the
@@ -1623,14 +1614,14 @@ int main(int argc, char **argv) {
     if (argc > 1) { fprintf(stderr, "gcpdot-music [start|show|dot|compare|score|mech H [METHOD]|backtest [MIN]|status]\n"); return 2; }
 
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
-    load_conf();
+    /* (bands.conf read above, before the command was chosen) */
     scan_tracks();
     series_open();   /* local: the egg's minutes (egg_load inside) */
     if (!src_local) egg_load();
     dots_sync();
     load_resolved();
     refit();
-    say("forecasts: %d resolved so far; blend Jev^%.2f * analog^%.2f", rn, blend_a, blend_c);
+    say("forecasts: %d resolved so far; blend Jev^%.2f * forecast^%.2f", rn, blend_a, blend_c);
     prefs_load();
     say("skips and replays known for %d songs", npref);
     char prev_id[96] = "", prev_url[4096] = "", *played[50] = { 0 };
@@ -1670,6 +1661,7 @@ int main(int argc, char **argv) {
     char queued_id[96] = "", queued_uri[4600] = "", last_track[256] = "";
     char queued_path[4096] = "", final_for[96] = "";   /* the queued song's file; the track whose final step is done */
     int queued_prov = 0;   /* the queued song is provisional (replaced if the final forecast draws another band) */
+    time_t retry_at = 0;   /* after a failed queue, the next try */
     int queued_band = -1, last_band = -1;
     /* The song this daemon queued, kept on disk: after a restart it is taken
      * over while VLC still holds it at that id, not queued a second time. */
@@ -1742,9 +1734,10 @@ int main(int argc, char **argv) {
             if (c) fclose(c);
         }
         if (!have) {
-            queued_id[0] = 0; last_track[0] = 0;   /* VLC gone: its ids start again */
+            queued_id[0] = 0; last_track[0] = 0; max_seen_id = 0;   /* VLC gone: its ids start again */
         } else {
             long cur = id_num(md.trackid);
+            int64_t pos = 0;
             if (cur > max_seen_id) max_seen_id = cur;
             /* Skips and replays. A skip: the song changed while more than
              * 15 s of the last one was left, its position carried on by the
@@ -1752,7 +1745,7 @@ int main(int argc, char **argv) {
              * question). A replay: the position jumped back over 10 s within
              * a song, or a song played within the last 50 starts again. */
             {
-                int64_t pos = vlc_position();
+                pos = vlc_position();
                 struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
                 int64_t now_us = (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
                 if (prev_id[0] && !strcmp(md.trackid, prev_id)) {
@@ -1782,6 +1775,11 @@ int main(int argc, char **argv) {
                 }
                 snprintf(prev_id, sizeof prev_id, "%s", md.trackid);
                 snprintf(prev_url, sizeof prev_url, "%s", md.url);
+                /* Right after a song change VLC can still report the last
+                 * song's position for a moment (a false replay and a
+                 * "0.1 min left" decision followed): a new song is taken
+                 * from its start until the next read. */
+                if (song_changed) pos = 0;
                 prev_len = md.length; prev_pos = pos; prev_obs = now_us; prev_playing = !strcmp(st, "Playing");
             }
             /* Our song started: its band at the start goes in the log. */
@@ -1834,9 +1832,12 @@ int main(int argc, char **argv) {
              * the provisional song, another replaces it. The band then
              * follows the final forecast exactly. A song with less left (a
              * skip into its end, a short one) gets the final step at once. */
-            double left_now = md.length > 0 ? (double) (md.length - vlc_position()) / 60e6 : 4;
+            double left_now = md.length > 0 ? (double) (md.length - pos) / 60e6 : 4;
             int late = left_now * 60 <= DECIDE_S || md.length <= 0;
-            int can = md.trackid[0] && strcmp(st, "Stopped") != 0 && sn >= 240;
+            /* not on the pass a song changed (its position is not read yet),
+             * nor while a failed queue waits out its 30 s */
+            int can = md.trackid[0] && strcmp(st, "Stopped") != 0 && sn >= 240 && !song_changed && now >= retry_at
+                      && (md.length <= 0 || pos <= md.length);   /* a position past the end is still the last song's */
             int phase = 0;   /* 1 provisional, 2 final */
             if (can && !late && !queued_id[0]) phase = 1;
             if (can && late && strcmp(final_for, md.trackid) && (!queued_id[0] || queued_prov)) phase = 2;
@@ -1907,7 +1908,7 @@ int main(int argc, char **argv) {
                             queued_band = nb;
                             FILE *q = fopen(qp, "w");
                             if (q) { fprintf(q, "%s\t%s\t%d\n", id, u, nb); fclose(q); }
-                        } else { say("could not queue %s", t); id[0] = 0; }
+                        } else { say("could not queue %s (again in 30 s)", t); id[0] = 0; retry_at = now + 30; }
                         free(u);
                     }
                 }
