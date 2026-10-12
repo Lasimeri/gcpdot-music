@@ -54,6 +54,7 @@ static const char *band_desc[NBANDS] = { "index below 0.05", "0.05 to 0.10", "0.
 #define MAXMIN (7 * 1440)          /* minutes of series kept */
 #define FETCH_S 120                /* besides each song change, the 24 h history fetched every 2 min (the change alert needs fresh minutes; gcp2.net's own gauge polls every 60 s) */
 #define LOOP_S 5
+#define DECIDE_S 60   /* the next song is decided this long before this one ends */
 #define UA "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 #define PLAYER "org.mpris.MediaPlayer2.vlc"
 #define MPATH "/org/mpris/MediaPlayer2"
@@ -1061,7 +1062,8 @@ static double alert_p[NBANDS]; static long alert_at; static int alert_ok;
 /* Live scoring of the alert: every alert (alerts.tsv: made, target minute,
  * band then, six probabilities) is scored once its target minute is in the
  * series, over the last 24 h: the top band right, band changes caught by an
- * alert (P(change) >= 0.6, the right band), alerts right, log loss. */
+ * alert (P(change) >= ALERT_P, the right band), alerts right, log loss. */
+#define ALERT_P (src_local ? 0.5 : 0.6)
 struct live { int n, ok, ch, caught, calls, callok; double ll; };
 static struct live live24;
 /* The latest band-change events for the display's log: a change that
@@ -1097,7 +1099,7 @@ static void alert_score(void) {
         int act = band_of(gdot[i]), top = 0, ob = -1;
         for (int b = 1; b < NBANDS; b++) if (p[b] > p[top]) top = b;
         for (int b = 0; b < NBANDS; b++) if (b != nb && (ob < 0 || p[b] > p[ob])) ob = b;
-        int call = 1 - p[nb] >= 0.6;
+        int call = 1 - p[nb] >= ALERT_P;
         live24.n++; live24.ok += top == act; live24.ll -= log(p[act] > 1e-6 ? p[act] : 1e-6);
         if (act != nb) { live24.ch++; live24.caught += call && ob == act; }
         if (call) { live24.calls++; live24.callok += ob == act; }
@@ -1191,7 +1193,7 @@ static int cmd_show(void) {
         }
         /* the two dots */
         /* no song forecast yet (a fresh source): the 2-minute alert forecast */
-        if (!havep && haveal) { for (int b = 0; b < NBANDS; b++) pred[b] = al[b]; pred_at = alert_at2; havep = 1; snprintf(src, sizeof src, "2-minute forecast"); }
+        if ((!havep || (latest && pred_at < latest)) && haveal) { for (int b = 0; b < NBANDS; b++) pred[b] = al[b]; pred_at = alert_at2; havep = 1; snprintf(src, sizeof src, "2-minute forecast"); }
         int pb = havep ? top_of(pred) : -1;
         draw_disc(3, 3, 12, gcp >= 0 ? colour_of(gcp) : 0x333333, bg);
         draw_disc(3, 27, 12, pb >= 0 ? colour_of(band_mid[pb]) : 0x333333, bg);
@@ -1206,9 +1208,11 @@ static int cmd_show(void) {
             /* the GCP minute it is for (it resolves when that minute arrives) */
             time_t tt = pred_at; char hm[8]; strftime(hm, sizeof hm, "%H:%M", localtime(&tt));
             printf("\033[11;27Hfor %s", hm);
-            /* The change alert: a band other than the live one at 0.6 or
-             * more by that minute (the balanced point of the backtest: at
-             * 2 min, 84% of changes caught, 84% of alerts right). */
+            /* The change alert: a band other than the live one at ALERT_P or
+             * more by that minute, the balanced point of the backtest: GCP
+             * 0.6 (at 2 min, 84% of changes caught, 84% of alerts right);
+             * local 0.5, a change more likely than not (2 min: 55% caught,
+             * 67% right; at 0.4, 65% and 61%). */
             if (gcp >= 0) {
                 /* the 2-minute alert forecast (made on every new minute) when
                  * there is one, else the song's forecast */
@@ -1217,7 +1221,7 @@ static int cmd_show(void) {
                 int nb = band_of(gcp), ob = -1;
                 for (int b = 0; b < NBANDS; b++) if (b != nb && (ob < 0 || pp[b] > pp[ob])) ob = b;
                 double pc = 1 - pp[nb];
-                if (pc >= 0.6) {
+                if (pc >= (local ? 0.5 : 0.6)) {
                     unsigned c = colour_of(band_mid[ob]);
                     printf("\033[12;3H\033[38;2;%u;%u;%um▲ change %s -> %s %.0f%% by %s", c >> 16, (c >> 8) & 255, c & 255, band_name[nb], band_name[ob], 100 * pc, am);
                 } else printf("\033[12;3H\033[38;2;100;100;100mno change by %s (%.0f%% chance)", am, 100 * pc);
@@ -1472,7 +1476,7 @@ static int cmd_mech(int h, int only) {
     series_open(); dots_sync(); psum_sync();
     for (int m = 0; m < 8; m++) {
         if (only >= 0 && m != only) continue;
-        int n = 0, ok = 0, pok = 0, ch = 0, chok = 0, called = 0, calledok = 0; double ll = 0;
+        int n = 0, ok = 0, pok = 0, ch = 0, chok = 0, called = 0, calledok = 0, tok = 0, tch = 0; double ll = 0, ep = 0;
         for (int t = 300; t + h < gdn; t += 2) {
             if (gdot[t] < 0 || gdot[t + h] < 0) continue;
             double p[NBANDS];
@@ -1480,12 +1484,14 @@ static int cmd_mech(int h, int only) {
             if (d < 0) continue;
             int act = band_of(gdot[t + h]), now_b = band_of(gdot[t]), pr = band_of(d);
             n++; ok += pr == act; pok += now_b == act; ll += ll_of(p, act);
+            int tp = top_of(p); tok += tp == act; ep += p[tp]; if (act != now_b) tch += tp == act;
             if (act != now_b) { ch++; chok += pr == act; }
             if (pr != now_b) { called++; calledok += pr == act; }
         }
         static const char *nm[8] = { "last value", "5-min trend", "AR(2) on changes", "ORACLE (actual)", "veridical mapping", "AR(2) hypo-priors", "AR(2) + time of day", "AR(2) + veridical" };
         printf("%d min ahead, netvar by %-17s %d minutes: right %.1f%% (persistence %.1f%%); band changes %d, caught %d (%.1f%%); changes called %d, right %d (%.1f%%); log loss %.3f\n",
                h, src_local ? (m == 3 ? "ORACLE (actual)" : "local exact chi2") : nm[m], n, 100.0 * ok / n, 100.0 * pok / n, ch, chok, ch ? 100.0 * chok / ch : 0, called, calledok, called ? 100.0 * calledok / called : 0, ll / n);
+        printf("    most probable band: right %.1f%%, changes caught %d (%.1f%%); its own expected accuracy %.1f%%\n", 100.0 * tok / n, tch, ch ? 100.0 * tch / ch : 0, 100.0 * ep / n);
     }
     /* A change called only when the AR(2) forecast gives the band now at
      * most 1 - THETA (a change at least THETA), the band called being the
@@ -1753,13 +1759,28 @@ int main(int argc, char **argv) {
                     queued_id[0] = 0;
                 }
             }
-            if (!queued_id[0] && md.trackid[0] && strcmp(st, "Stopped") != 0 && sn >= 240) {
-                double left = md.length > 0 ? (double) (md.length - vlc_position()) / 60e6 : 4;
+            /* The next song is decided DECIDE_S before this one ends, not when
+             * it starts: the forecast's horizon is then about a minute
+             * instead of the whole song (local backtest: 85.6% right 1
+             * minute ahead, 77.2% at 4). A song with less left (a skip into
+             * its end, a short one) is decided at once. */
+            double left_now = md.length > 0 ? (double) (md.length - vlc_position()) / 60e6 : 4;
+            int decide = left_now * 60 <= DECIDE_S || md.length <= 0;
+            if (decide && !queued_id[0] && md.trackid[0] && strcmp(st, "Stopped") != 0 && sn >= 240) {
+                double left = left_now;
                 if (left < 0) left = 0;
-                /* The forecast is for one GCP minute: the newest now plus the
-                 * song's time left (whole minutes), the same for Jev, the
-                 * analogs and the score. */
-                int hmin = (int) (left + 0.5); if (hmin < 1) hmin = 1;
+                /* The forecast is for one minute of the series. Local: the
+                 * last minute closed when this song ends (its minutes close
+                 * under a second late), the dot the next song starts on.
+                 * GCP: the newest now plus the time left, whole minutes (its
+                 * minutes arrive 2.5 to 4 minutes late). The same minute for
+                 * Jev, the forecast and the score. */
+                int hmin;
+                if (src_local) {
+                    long end_min = ((long) now + (long) (left * 60)) / 60 * 60;
+                    hmin = (int) ((end_min - sep[sn - 1]) / 60);
+                } else hmin = (int) (left + 0.5);
+                if (hmin < 1) hmin = 1;
                 long target = sep[sn - 1] + (long) hmin * 60;
                 double probs[NBANDS] = { 0 };
                 /* The mechanistic forecast first: the dot rebuilt from the
