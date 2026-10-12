@@ -43,6 +43,7 @@
 #include <systemd/sd-bus.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define NBANDS 6
 static const char *band_name[NBANDS] = { "red", "orange", "yellow", "green", "teal", "blue" };
@@ -242,9 +243,15 @@ static int fetch(void) {
         if (!strstr(j, "\"aggregates\"")) {
             for (char *q = j; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';
             say("history answer without data (attempt %d): %.200s", attempt + 1, j);
+            /* "Too Many Attempts.": gcp2.net's rate limit, on the one public
+             * token every visitor's browser shares, so it comes and goes with
+             * their traffic: waited out (5, 15, 30 s), the token kept. Any
+             * other answer: the token fetched again, once. */
+            int limited = strstr(j, "Too Many Attempts") != NULL;
             free(j);
-            if (attempt == 0) get_token();
-            if (attempt < 3) { sleep(3); continue; }
+            static const int wait_s[3] = { 5, 15, 30 };
+            if (!limited && attempt == 0) get_token();
+            if (attempt < 3) { sleep(limited ? wait_s[attempt] : 3); continue; }
             return -1;
         }
         char p[700]; series_path(p, sizeof p);
@@ -296,6 +303,103 @@ static int band_of(double x) {
 }
 static double dot_now(void) { return sn ? dot_at(sn, 0) : -1; }
 
+/* ---- the reference egg: this machine's RNG through GCP 1.0's math ----
+ * One trial a second, the sum of 200 bits from RDSEED (a GCP egg's trial:
+ * mean 100, variance 50), z = (trial - 100) / sqrt(50). The bits are
+ * independent, so a window's sum of z^2 over k seconds is chi-square with k
+ * degrees of freedom and its index is the exact upper-tail probability, the
+ * original dot's math; the 1 h and 2 h indexes, the one farther from 0.5.
+ * Raw trials per day in egg-YYYYMMDD.tsv (epoch, trial), minutes in
+ * egg-min.tsv (minute end, trials, sum z, sum z^2). It is the null
+ * reference beside GCP 2.0's network: the two are independent sources, so
+ * their dots should agree no better than chance. */
+static long emin[MAXMIN]; static int en[MAXMIN]; static double ez[MAXMIN], ez2[MAXMIN]; static int esn;
+static pthread_mutex_t emu = PTHREAD_MUTEX_INITIALIZER;
+static double egg_last_z; static long egg_trials;
+
+static void egg_push(long m, int n, double z, double z2) {
+    if (esn == MAXMIN) {
+        memmove(emin, emin + 1, (MAXMIN - 1) * sizeof *emin); memmove(en, en + 1, (MAXMIN - 1) * sizeof *en);
+        memmove(ez, ez + 1, (MAXMIN - 1) * sizeof *ez); memmove(ez2, ez2 + 1, (MAXMIN - 1) * sizeof *ez2); esn--;
+    }
+    emin[esn] = m; en[esn] = n; ez[esn] = z; ez2[esn] = z2; esn++;
+}
+static void egg_load(void) {
+    char p[700]; snprintf(p, sizeof p, "%s/egg-min.tsv", statedir);
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    long m; int n; double z, z2;
+    while (fscanf(f, "%ld %d %lf %lf", &m, &n, &z, &z2) == 4) if (!esn || m > emin[esn - 1]) egg_push(m, n, z, z2);
+    fclose(f);
+}
+static int popcount200(void) {
+    int c = 0;
+    for (int i = 0; i < 3; i++) c += __builtin_popcountll(rdseed64());
+    return c + __builtin_popcountll(rdseed64() & ((1ULL << 8) - 1));   /* 64 * 3 + 8 = 200 bits */
+}
+static void *egg_thread(void *arg) {
+    (void) arg;
+    long cur_m = 0; int n = 0; double sz = 0, sz2 = 0;
+    FILE *raw = NULL; char raw_day[16] = "";
+    char mp[700]; snprintf(mp, sizeof mp, "%s/egg-min.tsv", statedir);
+    for (;;) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 1; ts.tv_nsec = 0;
+        while (clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &ts, NULL) == EINTR) { }
+        long t = ts.tv_sec;
+        int trial = popcount200();
+        double z = (trial - 100) / sqrt(50.0);
+        char day[16]; time_t tt = t; strftime(day, sizeof day, "%Y%m%d", gmtime(&tt));
+        if (strcmp(day, raw_day)) {
+            if (raw) fclose(raw);
+            char rp[720]; snprintf(rp, sizeof rp, "%s/egg-%s.tsv", statedir, day);
+            raw = fopen(rp, "a"); snprintf(raw_day, sizeof raw_day, "%s", day);
+        }
+        if (raw) { fprintf(raw, "%ld\t%d\n", t, trial); if (t % 60 == 0) fflush(raw); }
+        long m = (t / 60) * 60 + 60;   /* the minute this second ends in, as GCP 2.0's end_epoch */
+        if (m != cur_m) {
+            if (cur_m && n) {
+                pthread_mutex_lock(&emu); egg_push(cur_m, n, sz, sz2); pthread_mutex_unlock(&emu);
+                FILE *f = fopen(mp, "a");
+                if (f) { fprintf(f, "%ld %d %.6f %.6f\n", cur_m, n, sz, sz2); fclose(f); }
+            }
+            cur_m = m; n = 0; sz = sz2 = 0;
+        }
+        n++; sz += z; sz2 += z * z;
+        egg_last_z = z; egg_trials++;
+    }
+    return NULL;
+}
+/* P(chi-square with k degrees of freedom >= x), Wilson-Hilferty (for the
+ * k of 3600 and more here, within about 1e-5 of the exact tail). */
+static double chi2_upper(double x, double k) {
+    if (k <= 0) return -1;
+    double h = 2.0 / (9.0 * k);
+    double zz = (cbrt(x / k) - (1.0 - h)) / sqrt(h);
+    return 0.5 * erfc(zz / sqrt(2.0));
+}
+/* The egg's index over the W minutes ending at minute END (an end_epoch),
+ * -1 when under 80% of those seconds were recorded. Lock held by caller. */
+static double egg_index_w(int w, long end) {
+    double s2 = 0; long k = 0;
+    for (int i = esn - 1; i >= 0; i--) {
+        if (emin[i] > end) continue;
+        if (emin[i] <= end - (long) w * 60) break;
+        s2 += ez2[i]; k += en[i];
+    }
+    if (k < (long) (0.8 * w * 60)) return -1;
+    return chi2_upper(s2, (double) k);
+}
+static double egg_dot_at(long end) {
+    pthread_mutex_lock(&emu);
+    double a = egg_index_w(60, end), b = egg_index_w(120, end);
+    pthread_mutex_unlock(&emu);
+    if (a < 0) return b;
+    if (b < 0) return a;
+    return fabs(b - 0.5) > fabs(a - 0.5) ? b : a;
+}
+static long egg_latest(void) { pthread_mutex_lock(&emu); long m = esn ? emin[esn - 1] : 0; pthread_mutex_unlock(&emu); return m; }
+
 /* ---- Jev ---- */
 static int ask_jev(double horizon_min, double probs[NBANDS]) {
     if (sn < 120) return -1;
@@ -311,6 +415,18 @@ static int ask_jev(double horizon_min, double probs[NBANDS]) {
         o += snprintf(state + o, sizeof state - o, "%s %.2f", k ? "," : "", x);
     }
     o += snprintf(state + o, sizeof state - o, ". Now: %.2f (%s).", dot_now(), band_name[band_of(dot_now())]);
+    /* The reference: this machine's hardware RNG through the same math, at
+     * the same minutes (independent of the network: chance agreement). */
+    double rnow = egg_dot_at(sep[sn - 1]);
+    if (rnow >= 0) {
+        o += snprintf(state + o, sizeof state - o, " Reference (this machine's own hardware random generator, one 200-bit trial a second, the same index with an exact chi-square; independent of the network) every 10 minutes over the same two hours:");
+        for (int k = 0; k < 12; k++) {
+            double x = egg_dot_at(sep[sn - 111 + k * 10]);
+            if (x >= 0) o += snprintf(state + o, sizeof state - o, "%s %.2f", k ? "," : "", x);
+            else o += snprintf(state + o, sizeof state - o, "%s none", k ? "," : "");
+        }
+        o += snprintf(state + o, sizeof state - o, ". Reference now: %.2f (%s).", rnow, band_name[band_of(rnow)]);
+    }
     char choice[1024]; int c = 0;
     c += snprintf(choice + c, sizeof choice - c, "band=Which band will the gcpdot index be in %.0f minutes from now?|", horizon_min < 1 ? 1 : horizon_min);
     for (int b = 0; b < NBANDS; b++) c += snprintf(choice + c, sizeof choice - c, "%s%s:%s", b ? ";" : "", band_name[b], band_desc[b]);
@@ -505,22 +621,67 @@ static int cmd_dot(void) {
     return 0;
 }
 
+/* GCP 2.0's dot against the reference egg's, minute by minute
+ * (compare.tsv: minute end, GCP netvar, GCP dot, reference dot, both bands),
+ * over the last 24 h: correlation, band agreement against what chance gives
+ * from the two sets of band shares, mean difference. */
+static int cmd_compare(void) {
+    char p[700]; snprintf(p, sizeof p, "%s/compare.tsv", statedir);
+    FILE *f = fopen(p, "r");
+    if (!f) { printf("no comparison yet (%s): the daemon writes it once the reference has an hour\n", p); return 1; }
+    static double g[1440], r[1440]; long last = 0; int n = 0, head = 0;
+    long e; double nv, gd, rd; char gb[16], rb[16];
+    while (fscanf(f, "%ld %lf %lf %lf %15s %15s", &e, &nv, &gd, &rd, gb, rb) == 6) {
+        g[head] = gd; r[head] = rd; head = (head + 1) % 1440; if (n < 1440) n++; last = e;
+    }
+    fclose(f);
+    if (n < 2) { printf("only %d minutes compared\n", n); return 1; }
+    double mg = 0, mr = 0; for (int i = 0; i < n; i++) { mg += g[i]; mr += r[i]; } mg /= n; mr /= n;
+    double sgg = 0, srr = 0, sgr = 0, ad = 0; int agree = 0, cg[NBANDS] = { 0 }, cr[NBANDS] = { 0 };
+    for (int i = 0; i < n; i++) {
+        sgg += (g[i] - mg) * (g[i] - mg); srr += (r[i] - mr) * (r[i] - mr); sgr += (g[i] - mg) * (r[i] - mr);
+        ad += fabs(g[i] - r[i]); agree += band_of(g[i]) == band_of(r[i]); cg[band_of(g[i])]++; cr[band_of(r[i])]++;
+    }
+    double chance = 0; for (int b = 0; b < NBANDS; b++) chance += (double) cg[b] / n * cr[b] / n;
+    time_t lt = last; char ts[32]; strftime(ts, sizeof ts, "%F %H:%M", localtime(&lt));
+    printf("minutes compared: %d (up to %s)\n", n, ts);
+    printf("dot correlation (Pearson r): %.3f\n", (sgg > 0 && srr > 0) ? sgr / sqrt(sgg * srr) : 0);
+    printf("same band: %.1f%% (chance from the band shares: %.1f%%)\n", 100.0 * agree / n, 100 * chance);
+    printf("mean |GCP dot - reference dot|: %.3f\n", ad / n);
+    printf("band shares  GCP:"); for (int b = 0; b < NBANDS; b++) printf(" %s %.1f%%", band_name[b], 100.0 * cg[b] / n);
+    printf("\n             reference:"); for (int b = 0; b < NBANDS; b++) printf(" %s %.1f%%", band_name[b], 100.0 * cr[b] / n);
+    printf("\nThe minutes overlap (a 1 h window moves one minute at a time), so the\nindependent samples are far fewer than the minutes: read r and agreement\nas a running picture, not a significance test.\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     paths();
     if (argc > 1 && !strcmp(argv[1], "dot")) return cmd_dot();
+    if (argc > 1 && !strcmp(argv[1], "compare")) return cmd_compare();
     if (argc > 1 && !strcmp(argv[1], "status")) {
         char p[700]; snprintf(p, sizeof p, "%s/status", statedir);
         FILE *f = fopen(p, "r"); if (!f) { printf("not running yet (no %s)\n", p); return 1; }
         char b[4096]; size_t n = fread(b, 1, sizeof b - 1, f); b[n] = 0; fclose(f); fputs(b, stdout);
         return 0;
     }
-    if (argc > 1) { fprintf(stderr, "gcpdot-music [dot|status]\n"); return 2; }
+    if (argc > 1) { fprintf(stderr, "gcpdot-music [dot|compare|status]\n"); return 2; }
 
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
     load_conf();
     scan_tracks();
     series_load();
+    egg_load();
+    pthread_t egg;
+    if (pthread_create(&egg, NULL, egg_thread, NULL)) { say("the reference egg did not start"); return 1; }
+    say("reference egg: %d minutes kept, one 200-bit RDSEED trial a second from now", esn);
+    /* The last minute compared (compare.tsv), so a restart goes on from it. */
+    char cp[700]; snprintf(cp, sizeof cp, "%s/compare.tsv", statedir);
+    long last_cmp = 0;
+    {
+        FILE *c = fopen(cp, "r");
+        if (c) { long e; char rest[256]; while (fscanf(c, "%ld%255[^\n]", &e, rest) == 2) last_cmp = e; fclose(c); }
+    }
     char lp[700]; snprintf(lp, sizeof lp, "%s/predictions.tsv", statedir);
     predlog = fopen(lp, "a");
     if (sd_bus_open_user(&bus) < 0) { say("no session bus"); return 1; }
@@ -566,6 +727,22 @@ int main(int argc, char **argv) {
         double dot = dot_now();
         int band = dot >= 0 ? band_of(dot) : 3;
         int stale = !last_ok || now - last_ok > 3 * FETCH_S;
+        /* Each GCP minute not yet compared, against the reference egg's dot
+         * at that minute (minutes before the egg had an hour are skipped). */
+        {
+            int i0 = sn;
+            while (i0 > 0 && sep[i0 - 1] > last_cmp) i0--;
+            FILE *c = i0 < sn ? fopen(cp, "a") : NULL;
+            for (int i = i0; i < sn; i++) {
+                double rd = egg_dot_at(sep[i]);
+                if (rd >= 0 && c) {
+                    double gd = dot_at(i + 1, 0);
+                    if (gd >= 0) fprintf(c, "%ld %.4f %.4f %.4f %s %s\n", sep[i], sval[i], gd, rd, band_name[band_of(gd)], band_name[band_of(rd)]);
+                }
+                last_cmp = sep[i];
+            }
+            if (c) fclose(c);
+        }
         if (!have) {
             queued_id[0] = 0; last_track[0] = 0;   /* VLC gone: its ids start again */
         } else {
@@ -642,8 +819,13 @@ int main(int argc, char **argv) {
             snprintf(last_track, sizeof last_track, "%s", md.trackid);
         }
         last_band = band;
-        write_status("dot %.3f (%s)%s, latest netvar %.4f, %d minutes kept\nVLC: %s%s\nqueued: %s%s%s\nswitch %s, Jev %s\n",
-                     dot, band_name[band], stale ? " STALE" : "", sn ? sval[sn - 1] : 0, sn,
+        long em = egg_latest();
+        double rdot = em ? egg_dot_at(em) : -1;
+        char ref[160];
+        if (rdot >= 0) snprintf(ref, sizeof ref, "%.3f (%s) at the minute ending %ld", rdot, band_name[band_of(rdot)], em);
+        else snprintf(ref, sizeof ref, "under an hour of trials yet (%ld trials, last z %+.2f)", egg_trials, egg_last_z);
+        write_status("dot %.3f (%s)%s, latest netvar %.4f, %d minutes kept\nreference egg: %s\nVLC: %s%s\nqueued: %s%s%s\nswitch %s, Jev %s\n",
+                     dot, band_name[band], stale ? " STALE" : "", sn ? sval[sn - 1] : 0, sn, ref,
                      have ? st : "not running", have ? "" : "", queued_id[0] ? queued_id : "nothing", queued_id[0] ? " band " : "",
                      queued_id[0] ? band_name[queued_band] : "", switch_now ? "now" : "next", use_jev ? "on" : "off");
         for (int i = 0; i < LOOP_S * 10 && !stop; i++) usleep(100000);

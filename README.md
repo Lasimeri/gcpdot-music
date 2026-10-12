@@ -5,7 +5,13 @@ Intel Phi Jev forecasting where it is going.
 
 - **The data:** GCP 2.0's network variance (gcp2.net, one value a minute), fetched the moment a song ends
   (so the next song is chosen on the newest minute; also every 30 min) and kept on
-  disk up to 7 days. GCP 1.0 stopped collecting on 3 April 2026.
+  disk up to 7 days. GCP 1.0 stopped collecting on 3 April 2026. gcp2.net rate-limits its one public token
+  ("Too Many Attempts.", shared with every visitor): such answers are waited out (5, 15, 30 s).
+- **The reference egg:** this machine's hardware RNG (RDSEED) through GCP 1.0's math, one trial a second
+  (the sum of 200 bits, z = (trial - 100)/sqrt(50)); its 1 h / 2 h index is the exact chi-square tail of the
+  summed z^2 (the original dot's math; Wilson-Hilferty). It is independent of the network, so it is the
+  null reference: `gcpdot-music compare` gives the dots' correlation, band agreement against chance and mean
+  difference over 24 h (compare.tsv), and Jev sees both. Raw trials: `egg-YYYYMMDD.tsv`; minutes: `egg-min.tsv`.
 - **The dot:** the share of past 1 h and 2 h windows whose mean variance is at least the latest one's; the
   index farther from 0.5 is shown, as the original showed the more coherent of its two windows. Bands as on
   the old dot: red < 0.05 (high variance), orange 0.05-0.10, yellow 0.10-0.40, green 0.40-0.90,
@@ -28,6 +34,7 @@ Intel Phi Jev forecasting where it is going.
 make -j && make install
 systemctl --user enable --now gcpdot-music   # off: systemctl --user disable --now gcpdot-music
 gcpdot-music dot                              # the dot now, band shares over 24 h, and a uniformity control
+gcpdot-music compare                          # GCP 2.0's dot against the reference egg's, last 24 h
 gcpdot-music status                           # what the running daemon last wrote
 ```
 

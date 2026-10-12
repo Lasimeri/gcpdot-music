@@ -4,7 +4,7 @@ PREFIX = $(HOME)/.local
 UNITDIR = $(HOME)/.config/systemd/user
 
 gcpdot-music: gcpdot-music.c
-	$(CC) $(CFLAGS) -o $@ $< $(shell pkg-config --cflags --libs libsystemd) -lm
+	$(CC) $(CFLAGS) -pthread -o $@ $< $(shell pkg-config --cflags --libs libsystemd) -lm
 
 install: gcpdot-music
 	install -Dm755 gcpdot-music $(PREFIX)/bin/gcpdot-music
